@@ -1,0 +1,6 @@
+{
+  "name": "rufur",
+  "version": "0.2.0",
+  "description": "RUFUR memory for Claude Code: automatic recall and capture, plus the rufur-memory skill and MCP tools.",
+  "author": { "name": "shravan-g-k" }
+}

@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+ui/node_modules/
+ui/dist/
+src/rufur/static/*
+!src/rufur/static/.gitkeep
+.rufur-dev/

@@ -1,0 +1,23 @@
+{
+  "description": "RUFUR: preload memory at session start, inject relevant memories per prompt, capture the conversation",
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/rufur_hook.py\"", "timeout": 8 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/rufur_hook.py\"", "timeout": 5 }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "WebFetch|WebSearch", "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/rufur_hook.py\"", "timeout": 5 }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/rufur_hook.py\"", "timeout": 5 }] }
+    ],
+    "SubagentStop": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/rufur_hook.py\"", "timeout": 10 }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/rufur_hook.py\"", "timeout": 5 }] }
+    ]
+  }
+}

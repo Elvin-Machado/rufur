@@ -1,0 +1,13 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rufur",
+  "description": "RUFUR knowledge brain: shared, provenance-tracked memory for your agents",
+  "owner": { "name": "shravan-g-k" },
+  "plugins": [
+    {
+      "name": "rufur",
+      "source": "./integrations/claude-code",
+      "description": "Gives Claude Code RUFUR memory automatically: preloads relevant memories at session start, injects them per prompt, captures the conversation, and teaches the workflow."
+    }
+  ]
+}
