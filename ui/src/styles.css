@@ -803,6 +803,19 @@ button.close {
   margin: 0;
 }
 
+.option {
+  display: grid;
+  gap: 0.3rem;
+  justify-items: start;
+  padding: 0.6rem 0.8rem;
+  background: white;
+  border-left: 3px solid var(--paper-edge);
+}
+
+.option p {
+  margin: 0;
+}
+
 .row {
   display: flex;
   gap: 0.5rem;

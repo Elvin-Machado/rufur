@@ -48,6 +48,11 @@ def default_roles() -> dict[str, list[ProviderRef]]:
             ("ollama", "gpt-oss:120b-cloud"),
             ("openai_compat", "llama-3.3-70b-versatile", *GROQ),
         ),
+        "resolve": _chain(
+            ("ollama", "qwen2.5:7b-instruct"),
+            ("ollama", "gpt-oss:120b-cloud"),
+            ("openai_compat", "llama-3.3-70b-versatile", *GROQ),
+        ),
         "verify": _chain(
             ("ollama", "qwen2.5:7b-instruct"),
             ("ollama", "gpt-oss:120b-cloud"),
@@ -103,6 +108,7 @@ class Config:
     stm_max_ttl_h: float = 168.0  # hard cap from creation
     stm_grace_h: float = 24.0  # archived (hidden, recoverable) before hard delete
     sweep_every_min: float = 15.0
+    session_idle_extract_min: float = 10.0  # extract a session's messages once it has been quiet this long
 
     # Consolidation (STM → LTM)
     nightly_hour: int = 3  # local time
@@ -117,6 +123,11 @@ class Config:
 
     # Subagent scratch pools
     scratch_ttl_min: int = 120
+
+    # Conflict resolution: memory layer first, then the calling agent, then a safe default
+    auto_resolve_confidence: float = 0.8  # resolver LLM must be at least this sure to settle a conflict itself
+    decision_default_after_days: float = 7.0  # open decisions nobody answers get the default rule
+    user_presence_window_min: float = 30.0  # decided_by="user" needs a user message this recent
 
     # Write-anomaly guard
     max_writes_per_min: int = 60

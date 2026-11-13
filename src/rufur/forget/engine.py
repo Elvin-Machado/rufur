@@ -41,13 +41,16 @@ def expand(db: Database, memory_ids: list[str], include_history: bool = True) ->
     return list(out.values())
 
 
-def key_strings(db: Database, mems: list[dict]) -> list[str]:
-    ids = [m["id"] for m in mems]
+def key_strings(db: Database, mems: list[dict], exclude: list[str] | None = None) -> list[str]:
+    """Strings that identify the forgotten content. `exclude` are ids being deleted alongside (so a
+    value they contain doesn't count as 'still used elsewhere')."""
+    ids = exclude or [m["id"] for m in mems]
     marks = ",".join("?" * len(ids))
     strings: set[str] = set()
     for m in mems:
         strings.add(m["text"])
-    for r in db.all(f"SELECT quote FROM memory_sources WHERE memory_id IN ({marks})", tuple(ids)):
+    target_marks = ",".join("?" * len(mems))
+    for r in db.all(f"SELECT quote FROM memory_sources WHERE memory_id IN ({target_marks})", tuple(m["id"] for m in mems)):
         if len(r["quote"]) >= 4:
             strings.add(r["quote"])
     # The bare value ("Berlin") is the most likely thing to linger in token indexes, but only scan
@@ -90,21 +93,23 @@ def redact_events(db: Database, mems: list[dict], strings: list[str]) -> int:
 def forget(cfg: Config, db: Database, ledger: Ledger, embedder, llm: LLM, memory_ids: list[str], agent: str,
            include_history: bool = True, verify: bool = True) -> dict:  # fmt: skip
     mems = expand(db, memory_ids, include_history)
-    # Daily journals that summarised these memories go too; their text may contain the fact.
-    ids0 = [m["id"] for m in mems]
-    if ids0:
-        marks = ",".join("?" * len(ids0))
-        for r in db.all(f"SELECT DISTINCT child_id FROM lineage WHERE child_kind = 'journal' AND memory_id IN ({marks})", tuple(ids0)):
-            if r["child_id"] not in ids0 and (j := db.one("SELECT * FROM memories WHERE id = ?", (r["child_id"],))):
-                mems.append(j)
     if not mems:
         return {"forgotten": [], "report": None, "error": "no matching memories"}
-    ids = [m["id"] for m in mems]
-    strings = key_strings(db, mems)
+    # Daily journals that summarised these memories are deleted too (their text may contain the fact).
+    # They are collateral, not targets: their sources quote the whole day, so they must not decide what
+    # gets redacted or what the verification looks for.
+    ids0 = [m["id"] for m in mems]
+    marks = ",".join("?" * len(ids0))
+    journals = [j for r in db.all(
+        f"SELECT DISTINCT child_id FROM lineage WHERE child_kind = 'journal' AND memory_id IN ({marks})", tuple(ids0))
+        if r["child_id"] not in ids0 and (j := db.one("SELECT * FROM memories WHERE id = ?", (r["child_id"],)))]  # fmt: skip
+    ids = ids0 + [j["id"] for j in journals]
+    strings = key_strings(db, mems, exclude=ids)
 
     tombstones = sum(tombstone.add(db, m) for m in mems)
     redacted = redact_events(db, mems, strings)
     counts = purge_memories(db, ids)
+    counts["journals"] = len(journals)
     # Ops and audit rows already carry no content; tombstone the ops so sync replicas apply the delete first.
     for mid in ids:
         ledger.op("delete", mid, agent, {})
@@ -114,6 +119,8 @@ def forget(cfg: Config, db: Database, ledger: Ledger, embedder, llm: LLM, memory
         ledger.bus.publish("memory.deleted", id=mid)
 
     report = probes.verify(cfg, db, embedder, llm, ids, mems, strings) if verify else None
+    if journals and report is not None:
+        report["note"] += " Daily journal entries that mentioned it were deleted too."
     return {
         "forgotten": [{"id": m["id"], "type": m["type"], "subject_key": sha256(norm_key(m["subject"]))[:12]} for m in mems],
         "purged": counts,

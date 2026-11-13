@@ -18,7 +18,7 @@ from ..forget import tombstone
 from ..ledger import Ledger
 from ..llm import LLM
 from ..textutil import norm_key, now
-from . import conflict
+from . import conflict, resolve
 from .importance import initial_importance
 from .trust import TRUST_ORDER, initial_status, instruction_like, trust_at_least, trust_for
 
@@ -45,6 +45,7 @@ class CommitResult:
     outcome: str  # created | duplicate | corroborated | tombstoned
     related: list[dict] = field(default_factory=list)  # [{id, outcome, reason}]
     llm_tokens: int = 0
+    conflict_id: str | None = None  # set when this write disagrees with an existing memory
 
     def summary(self) -> dict[str, Any]:
         m = self.memory
@@ -52,6 +53,7 @@ class CommitResult:
             "outcome": self.outcome,
             "memory": None if m is None else {k: m[k] for k in ("id", "status", "trust", "type", "text")},
             "related": self.related,
+            "conflict_id": self.conflict_id,
         }
 
 
@@ -214,7 +216,19 @@ class WritePath:
         if status == "quarantined":
             self.ledger.op("quarantine", mem["id"], agent["name"], {"flags": flags})
         self.ledger.audit(agent["name"], "write", mem["id"], {"status": status, "pool": pool_id})
-        return CommitResult(mem, "created", related, llm_tokens)
+        # Disagreements the rules above couldn't settle become a conflict for the resolver.
+        challenged = [f.split(":", 1)[1] for f in flags if f.startswith(("supersede_needs_confirmation:", "conflicts_with:"))]
+        conflict_id = None
+        if challenged:
+            conflict_id = resolve.open_conflict(self.db, self.ledger, "override", mem, challenged, agent["user_id"])
+        elif to_dispute and status != "quarantined":
+            conflict_id = resolve.open_conflict(self.db, self.ledger, "dispute", mem, [o["id"] for o in to_dispute],
+                                                agent["user_id"])  # fmt: skip
+        elif to_dispute:
+            # A quarantined newcomer disputing a live memory is an override attempt.
+            conflict_id = resolve.open_conflict(self.db, self.ledger, "override", mem, [o["id"] for o in to_dispute],
+                                                agent["user_id"])  # fmt: skip
+        return CommitResult(mem, "created", related, llm_tokens, conflict_id)
 
     def _corroborate(self, existing: dict, claim: ClaimIn, agent: dict, source_type: str, trust: str,
                      sources: list[tuple[str, str]], llm_tokens: int) -> CommitResult:  # fmt: skip
@@ -234,7 +248,11 @@ class WritePath:
         outcome = "duplicate"
         if existing["status"] == "quarantined":
             independent = source_type != existing["source_type"] or agent["name"] != existing["author_agent"]
-            flagged = "instruction_like" in str(existing["flags"]) or instruction_like(claim.text)
+            # Agreement alone never lifts a claim that contradicts a trusted memory; that is the resolver's call.
+            flagged = (
+                "instruction_like" in str(existing["flags"]) or instruction_like(claim.text)
+                or "conflicts_with:" in str(existing["flags"]) or "supersede_needs_confirmation:" in str(existing["flags"])
+            )  # fmt: skip
             if not flagged and trust != "low" and independent:
                 updates["status"] = "active"
                 updates["trust"] = max(existing["trust"], trust, key=TRUST_ORDER.index)

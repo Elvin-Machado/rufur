@@ -29,6 +29,7 @@ from .read.verify import make_verifier
 from .read import working_set as ws_mod
 from . import pools as pools_mod, stm as stm_mod
 from .write import consolidate as consolidate_mod
+from .write import resolve as resolve_mod
 from .textutil import estimate_tokens, new_id, now, quote_in, sha256
 from .write.extract import extract_claims
 from .write.importance import retention_score
@@ -284,7 +285,7 @@ class MemoryService:
             res = self.writer.commit(_claim_in(claim), pool_id=s["pool_id"], agent=agent, source_type=ev["source_type"],
                                      sources=[(ev["id"], claim.quote)], session_id=session_id, tier="stm",
                                      target_pool=s["target_pool"], candidate_pools=[s["pool_id"], s["target_pool"]])  # fmt: skip
-            results.append(res.summary())
+            results.append(self._settle(res.summary()))
         marks = ",".join("?" * len(events))
         self.db.execute(f"UPDATE events SET extracted = 1 WHERE id IN ({marks})", tuple(e["id"] for e in events))
         self.ledger.metric("extract", (time.perf_counter() - started) * 1000, path=usage.model, agent=s["agent"],
@@ -372,7 +373,7 @@ class MemoryService:
                 current = self.ledger.get_memory(res.memory["id"])["flags"]
                 self.ledger.update_memory(res.memory["id"], flags=sorted(set(current) | set(flags_extra)))
             llm_tokens += res.llm_tokens
-            results.append(res.summary())
+            results.append(self._settle(res.summary()))
         self.ledger.metric("remember", (time.perf_counter() - started) * 1000, path="write", agent=agent,
                            tokens_in=estimate_tokens(text), llm_tokens=llm_tokens)  # fmt: skip
         self._guard(agent)
@@ -384,35 +385,102 @@ class MemoryService:
         return out
 
     def confirm_memory(self, agent: str, memory_id: str, action: str = "confirm") -> dict:
-        """User decision on a quarantined or disputed memory."""
+        """Accept or reject one memory. Conflicts it's part of are resolved in its favour (or against it).
+
+        Raising a memory to user-confirmed needs the user in the loop: the UI, or an agent with a fresh user
+        message. Otherwise an agent's confirmation counts as the agent's own decision and can't raise trust.
+        """
         m = self._readable_memory(agent, memory_id)
+        if action not in ("confirm", "reject"):
+            raise ValueError("action must be 'confirm' or 'reject'")
+        by = "user" if self._user_present(agent) else "agent"
+        open_ids = [r["id"] for r in self.db.all("SELECT id, memory_ids FROM conflicts WHERE status = 'open'")
+                    if memory_id in json.loads(r["memory_ids"])]  # fmt: skip
+        if open_ids:
+            out = []
+            for cid in open_ids:
+                if action == "confirm":
+                    out.append(self.resolve_conflict(agent, cid, action="keep", winner=memory_id, decided_by=by))
+                else:
+                    others = [x for x in json.loads(self.db.scalar("SELECT memory_ids FROM conflicts WHERE id = ?", (cid,)))
+                              if x != memory_id]  # fmt: skip
+                    out.append(self.resolve_conflict(agent, cid, action="keep", winner=others[0], decided_by=by)
+                               if others else {})  # fmt: skip
+            return {"id": memory_id, "resolved_conflicts": out}
         if action == "reject":
             self.ledger.update_memory(memory_id, status="rejected", valid_to=now())
             self.ledger.op("reject", memory_id, agent)
             return {"id": memory_id, "status": "rejected"}
-        if action != "confirm":
-            raise ValueError("action must be 'confirm' or 'reject'")
-        superseded = []
-        for flag in m["flags"]:
-            if flag.startswith("supersede_needs_confirmation:"):
-                old = flag.split(":", 1)[1]
-                self.ledger.update_memory(old, status="superseded", valid_to=now(), superseded_by=memory_id)
-                superseded.append(old)
-        if m["status"] == "disputed":
-            # Confirming one side of a dispute supersedes the other live versions of the same key.
-            for other in self.db.all(
-                "SELECT id FROM memories WHERE pool_id = ? AND subject = ? AND predicate = ? AND status = 'disputed' AND id != ?",
-                (m["pool_id"], m["subject"], m["predicate"], memory_id),
-            ):
-                self.ledger.update_memory(other["id"], status="superseded", valid_to=now(), superseded_by=memory_id)
-                superseded.append(other["id"])
-        flags = [f for f in m["flags"] if not f.startswith("supersede_needs_confirmation:")] + ["user_confirmed"]
+        if m["status"] == "quarantined" and by != "user":
+            raise AccessDenied("held memories can only be approved by the user; ask them and pass their answer")
         days = consolidate_mod.REVALIDATE_DAYS.get(m["volatility"])
-        self.ledger.update_memory(memory_id, status="active", trust="high", flags=flags,
-                                  revalidate_at=now() + days * 86400 if days else None)  # fmt: skip
-        self.ledger.op("confirm", memory_id, agent, {"superseded": superseded})
-        self.ledger.audit(agent, "memory.confirm", memory_id)
-        return {"id": memory_id, "status": "active", "superseded": superseded}
+        updates: dict = {"status": "active", "revalidate_at": now() + days * 86400 if days else None}
+        if by == "user":
+            updates.update(trust="high", flags=sorted(set(m["flags"]) | {"user_confirmed"}))
+        self.ledger.update_memory(memory_id, **updates)
+        self.ledger.op("confirm", memory_id, agent, {"by": by})
+        self.ledger.audit(agent, "memory.confirm", memory_id, {"by": by})
+        return {"id": memory_id, "status": "active", "decided_by": by}
+
+    # ------------------------------------------------------------- conflicts
+
+    def _settle(self, summary: dict) -> dict:
+        """Give the memory layer its own go at a new conflict; report what happened to the writer."""
+        if summary.get("conflict_id"):
+            summary["conflict"] = resolve_mod.auto_resolve(self, summary["conflict_id"])
+            if summary["memory"]:
+                summary["memory"]["status"] = self.ledger.get_memory(summary["memory"]["id"])["status"]
+        return summary
+
+    def _user_present(self, agent: str) -> bool:
+        """True for the UI, or when the user wrote to *this* agent very recently (its captured prompts).
+
+        An agent can only speak for the user if the user was actually talking to it.
+        """
+        if agent == "ui":
+            return True
+        return bool(self.db.scalar(
+            "SELECT 1 FROM events WHERE agent = ? AND role = 'user' AND source_type = 'user' AND created_at > ? LIMIT 1",
+            (agent, now() - self.cfg.user_presence_window_min * 60),
+        ))  # fmt: skip
+
+    def _conflict_visible(self, agent: str, cid: str) -> list[dict]:
+        mems = [self.ledger.get_memory(mid) for mid in json.loads(
+            self.db.scalar("SELECT memory_ids FROM conflicts WHERE id = ?", (cid,)) or "[]")]  # fmt: skip
+        mems = [m for m in mems if m]
+        if not mems or not all(self._can_read_memory(agent, m) for m in mems):
+            raise NotFound(f"conflict {cid!r} not found")
+        return mems
+
+    def pending_decisions(self, agent: str, limit: int = 20) -> list[dict]:
+        """Conflicts the memory layer couldn't settle, for the calling agent to decide."""
+        a = self.agent(agent)
+        out = []
+        for r in self.db.all("SELECT id FROM conflicts WHERE user_id = ? AND status = 'open' ORDER BY created_at LIMIT ?",
+                             (a["user_id"], limit)):  # fmt: skip
+            try:
+                self._conflict_visible(agent, r["id"])
+            except NotFound:
+                continue
+            out.append(resolve_mod.decision(self, r["id"]))
+        return out
+
+    def resolve_conflict(self, agent: str, conflict_id: str, *, action: str = "keep", winner: str | None = None,
+                         scopes: dict | None = None, reason: str = "", decided_by: str = "agent") -> dict:  # fmt: skip
+        """The calling agent's decision. decided_by="user" is believed only if the user wrote recently."""
+        mems = self._conflict_visible(agent, conflict_id)
+        if self.db.scalar("SELECT status FROM conflicts WHERE id = ?", (conflict_id,)) != "open":
+            return resolve_mod.decision(self, conflict_id) | {"note": "already settled"}
+        by = "user" if decided_by == "user" and self._user_present(agent) else "agent"
+        if resolve_mod.needs_user(mems) and by != "user":
+            # Letting an agent swap something the user said for a less trusted source is the planted-fact attack.
+            if not (action == "keep" and winner and self.ledger.get_memory(winner)["trust"] == "high"):
+                raise AccessDenied("this decision would replace something the user said with a less trusted source; "
+                                   "ask the user and pass decided_by='user'")  # fmt: skip
+        out = resolve_mod.apply(self, conflict_id, action=action, winner=winner, scopes=scopes, by=by,
+                                reason=reason or f"decided by {agent}")  # fmt: skip
+        self.ledger.audit(agent, "conflict.decide", conflict_id, {"by": by, "action": action})
+        return out
 
     # ----------------------------------------------------------------- reads
 
@@ -441,6 +509,9 @@ class MemoryService:
         ids = [it["id"] for it in res["items"]]
         if ws is not None:
             ws["sent"].update(ids)
+        res["decisions_needed"] = self._decisions_for(ids)
+        if res["decisions_needed"]:
+            res["context"] += "\n" + _render_decisions(res["decisions_needed"])
         stm_hits = [it for it in res["items"] if it.get("tier") == "stm"]
         stm_mod.extend_expiry(self, [it["id"] for it in stm_hits])
         if record:
@@ -453,6 +524,13 @@ class MemoryService:
             self.ledger.audit(agent, "recall", None, {"items": ids})
             self.bus.publish("recall", agent=agent, items=ids, abstained=res["abstained"])
         return res
+
+    def _decisions_for(self, memory_ids: list[str]) -> list[dict]:
+        if not memory_ids:
+            return []
+        want = set(memory_ids)
+        return [resolve_mod.decision(self, r["id"]) for r in self.db.all(
+            "SELECT id, memory_ids FROM conflicts WHERE status = 'open'") if want & set(json.loads(r["memory_ids"]))]  # fmt: skip
 
     def recall_past(self, agent: str, query: str, *, since: float | None = None, until: float | None = None,
                     include_history: bool = True, token_budget: int | None = None) -> dict:  # fmt: skip
@@ -478,7 +556,12 @@ class MemoryService:
         """Start (or reuse) a session and preload its working set; the result is meant for context injection."""
         if not session_id:
             session_id = self.session_start(agent, pool=pool)["session_id"]
-        return ws_mod.build(self, agent, session_id, project, prompt)
+        out = ws_mod.build(self, agent, session_id, project, prompt)
+        pending = self.pending_decisions(agent, limit=3)
+        if pending:
+            out["decisions_needed"] = pending
+            out["context"] = "\n\n".join(filter(None, [out["context"], _render_decisions(pending)]))
+        return out
 
     def _readable_memory(self, agent: str, memory_id: str) -> dict:
         m = self.ledger.get_memory(memory_id)
@@ -682,7 +765,9 @@ class MemoryService:
         return {"closed": closed}
 
     def sweep(self) -> dict:
-        return stm_mod.sweep(self)
+        out = stm_mod.sweep(self)
+        out["decisions_defaulted"] = resolve_mod.apply_defaults(self)
+        return out
 
     def stm_stats(self) -> dict:
         out = stm_mod.suggest_ttl(self)
@@ -880,3 +965,15 @@ def _claim_in(claim) -> ClaimIn:
         relation=claim.relation.model_dump() if claim.relation else None,
         table_row=claim.table_row.model_dump() if claim.table_row else None,
     )
+
+
+def _render_decisions(decisions: list[dict]) -> str:
+    """Open conflicts as a block the calling agent can act on."""
+    lines = ['<decisions-needed note="RUFUR could not settle these. Decide from the conversation if you can; '
+             'if needs_user is true, ask the user. Answer with resolve_conflict.">']
+    for d in decisions:
+        opts = " | ".join(f'{o["memory_id"]}: "{o["text"]}" ({o["source"]}, {o["trust"]} trust)' for o in d["options"])
+        lines.append(f'<decision id="{d["conflict_id"]}" needs_user="{str(d["needs_user"]).lower()}" '
+                     f'recommended="{d["recommendation"]["memory_id"]}">{d["question"]} {opts}</decision>')
+    lines.append("</decisions-needed>")
+    return "\n".join(lines)

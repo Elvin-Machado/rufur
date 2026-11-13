@@ -102,6 +102,14 @@ class CloseIn(BaseModel):
     summary: str | None = None
 
 
+class DecisionIn(BaseModel):
+    action: Literal["keep", "both", "neither"] = "keep"
+    winner: str | None = None
+    scopes: dict[str, str] | None = None
+    reason: str = ""
+    decided_by: Literal["agent", "user"] = "agent"
+
+
 class SubagentStoppedIn(BaseModel):
     session_id: str | None = None
 
@@ -272,6 +280,15 @@ def create_app(service: MemoryService, *, mcp_app=None, mcp_session_manager=None
     @app.post("/v1/pools/{pool_id}/close")
     def pool_close(pool_id: str, body: CloseIn | None = None, a: str = A):
         return S.pool_close(a, pool_id, summary=(body or CloseIn()).summary)
+
+    @app.get("/v1/decisions")
+    def pending_decisions(a: str = A):
+        return S.pending_decisions(a)
+
+    @app.post("/v1/decisions/{conflict_id}")
+    def resolve_conflict(conflict_id: str, body: DecisionIn, a: str = A):
+        return S.resolve_conflict(a, conflict_id, action=body.action, winner=body.winner, scopes=body.scopes,
+                                  reason=body.reason, decided_by=body.decided_by)  # fmt: skip
 
     @app.get("/v1/scratch-pools")
     def scratch_pools(a: str = A):

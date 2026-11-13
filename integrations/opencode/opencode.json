@@ -4,7 +4,9 @@
     "rufur": {
       "type": "remote",
       "url": "http://127.0.0.1:7437/mcp",
-      "headers": { "X-Rufur-Agent": "opencode" },
+      "headers": {
+        "X-Rufur-Agent": "opencode"
+      },
       "enabled": true
     }
   }

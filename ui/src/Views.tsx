@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, Memory, since, SOURCE_LABEL, STORE_LABEL, Task, until } from "./api";
+import { api, Decision, Memory, since, SOURCE_LABEL, STORE_LABEL, Task, until } from "./api";
 
 type Select = (id: string) => void;
 
@@ -47,18 +47,23 @@ export function Timeline({ onSelect, version }: { onSelect: Select; version: num
 
 export function Review({ onSelect, version, onChanged }: { onSelect: Select; version: number; onChanged: () => void }) {
   const [items, setItems] = useState<Awaited<ReturnType<typeof api.quarantine>>>([]);
-  const [disputed, setDisputed] = useState<Memory[]>([]);
+  const [decisions, setDecisions] = useState<Decision[]>([]);
   useEffect(() => {
     api.quarantine().then(setItems);
-    api.memories("?status=disputed").then(setDisputed);
+    api.decisions().then(setDecisions);
   }, [version]);
 
-  async function decide(id: string, action: "confirm" | "reject") {
+  async function decide(d: Decision, winner: string | null) {
+    await api.decide(d.conflict_id, winner, winner ? "keep" : "neither");
+    onChanged();
+  }
+
+  async function review(id: string, action: "confirm" | "reject") {
     await api.confirm(id, action);
     onChanged();
   }
 
-  if (!items.length && !disputed.length) return <Empty text="Nothing to review. Suspicious or conflicting memories will show up here." />;
+  if (!items.length && !decisions.length) return <Empty text="Nothing to review. Suspicious or conflicting memories will show up here." />;
   return (
     <div className="pane review">
       {items.length > 0 && (
@@ -76,33 +81,49 @@ export function Review({ onSelect, version, onChanged }: { onSelect: Select; ver
                   {SOURCE_LABEL[m.source_type] ?? m.source_type}, by {m.author_agent}, {since(m.created_at)}
                 </p>
                 <div className="row">
-                  <button className="primary" onClick={() => decide(m.id, "confirm")}>
+                  <button className="primary" onClick={() => review(m.id, "confirm")}>
                     Approve
                   </button>
-                  <button onClick={() => decide(m.id, "reject")}>Reject</button>
+                  <button onClick={() => review(m.id, "reject")}>Reject</button>
                 </div>
               </li>
             ))}
           </ul>
         </section>
       )}
-      {disputed.length > 0 && (
+      {decisions.length > 0 && (
         <section>
-          <h2>Conflicting memories</h2>
-          <p className="muted">These disagree and RUFUR couldn’t tell which is right. Agents see both, marked as disputed.</p>
+          <h2>Open decisions</h2>
+          <p className="muted">
+            RUFUR couldn’t settle these itself, so they’ve been handed to your agents. You can decide here too. Without a decision, the
+            safer option is kept automatically.
+          </p>
           <ul>
-            {disputed.map((m) => (
-              <li key={m.id}>
-                <button className="link mem-line" onClick={() => onSelect(m.id)}>
-                  {m.text}
-                </button>
+            {decisions.map((d) => (
+              <li key={d.conflict_id}>
+                <p>
+                  {d.question}
+                  {d.needs_user && <span className="chip s-quarantined">needs you</span>}
+                </p>
+                {d.options.map((o) => (
+                  <div key={o.memory_id} className="option">
+                    <button className="link mem-line" onClick={() => onSelect(o.memory_id)}>
+                      {o.text}
+                    </button>
+                    <p className="muted small">
+                      {SOURCE_LABEL[o.source] ?? o.source} via {o.agent}, {since(o.recorded_at)}
+                      {o.memory_id === d.recommendation.memory_id && ` · default choice (${d.recommendation.reason})`}
+                    </p>
+                    <button className="primary" onClick={() => decide(d, o.memory_id)}>
+                      Keep this one
+                    </button>
+                  </div>
+                ))}
                 <p className="muted small">
-                  {SOURCE_LABEL[m.source_type] ?? m.source_type}, {since(m.created_at)}
+                  {d.tried.map((t) => t.outcome).join("; ")}. Kept automatically {until(d.default_at)} if nobody decides.
                 </p>
                 <div className="row">
-                  <button className="primary" onClick={() => decide(m.id, "confirm")}>
-                    Keep this version
-                  </button>
+                  <button onClick={() => decide(d, null)}>Neither is right</button>
                 </div>
               </li>
             ))}

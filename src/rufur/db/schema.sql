@@ -152,6 +152,23 @@ CREATE TABLE IF NOT EXISTS pool_members (
 );
 CREATE INDEX IF NOT EXISTS pool_members_memory ON pool_members(memory_id);
 
+-- Conflicts the memory layer couldn't settle by rule, by evidence, or with its own LLM judgement.
+-- Open ones are handed to the calling agent through recall results and the decisions API.
+CREATE TABLE IF NOT EXISTS conflicts (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    kind        TEXT NOT NULL,     -- dispute (equal trust) | override (less trusted source vs. a trusted one)
+    memory_ids  TEXT NOT NULL,     -- JSON list; the first is the newcomer
+    subject     TEXT NOT NULL DEFAULT '',
+    predicate   TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL,     -- open | auto_resolved | resolved | defaulted
+    resolution  TEXT,              -- JSON: {action, winner, by, reason}
+    attempts    TEXT NOT NULL DEFAULT '[]',  -- JSON: what the resolver tried and why it stopped
+    created_at  REAL NOT NULL,
+    resolved_at REAL
+);
+CREATE INDEX IF NOT EXISTS conflicts_status ON conflicts(user_id, status);
+
 CREATE TABLE IF NOT EXISTS consolidation_runs (
     id          TEXT PRIMARY KEY,
     user_id     TEXT NOT NULL,

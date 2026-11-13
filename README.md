@@ -33,15 +33,20 @@ It runs as an Ollama-style local daemon on `127.0.0.1:7437`, which serves the RE
 - **Stale:**
   - Every memory records when it was learned and when it was true. An update closes the old version instead of deleting it.
   - Changeable facts get a revalidation date. After it passes, the fact is still returned but tagged `stale="needs confirmation"` and ranked lower.
-- **Contradictory:**
-  - An LLM label of "update" is accepted only when the *source text* signals a change.
-  - Otherwise, the more trusted source wins, the user's own confirmation beats everything, and equal-trust conflicts are returned as **disputed** for the user to settle.
-  - A nightly sweep catches conflicts between agents.
+- **Contradictory:** RUFUR settles what it can and hands the rest to the calling agent. There is no UI step.
+  1. Rules: a tool or web claim never beats an existing memory, an earlier user confirmation wins, and clearly better-corroborated claims win. An LLM label of "update" counts only when the *source text* signals a change.
+  2. The memory layer's own LLM re-reads both source messages. Its verdict counts only if it's confident, and it can never hand the win to a less trusted source.
+  3. Otherwise the calling agent decides. Recall results carry `decisions_needed` (also in `pending_decisions`), and the agent answers with `resolve_conflict`. It asks the user only when `needs_user` is true, meaning a less trusted source would replace something the user said, and RUFUR accepts `decided_by="user"` only if the user just wrote to that agent.
+  4. Nothing waits forever: after 7 days the more trusted (then newer) version wins, and the loser stays in history.
 - **Planted:**
   - Trust comes from where the quote physically sits (user turn, document, tool or web output). The LLM can never raise it.
   - Low-trust and instruction-like content is quarantined until an independent source corroborates it or the user approves it.
   - An agent that writes in bursts or keeps trying to override trusted facts is quarantined automatically.
   - Retrieved memories are always wrapped as data, never instructions.
+
+## Try it
+
+[`docs/TRY_IT.md`](docs/TRY_IT.md) walks through every feature hands-on with copy-paste commands against a throwaway daemon, plus Claude Code and opencode.
 
 ## Quick start
 
@@ -94,6 +99,7 @@ Merge `integrations/opencode/opencode.json` into your opencode config, which add
 | `confirm_memory` | `POST /v1/memories/{id}/confirm` |
 | `forget` | `POST /v1/forget` |
 | `consolidate` | `POST /v1/consolidate` |
+| `pending_decisions` / `resolve_conflict` | `GET /v1/decisions`, `POST /v1/decisions/{id}` |
 | `pool_spawn` / `pool_close` | `POST /v1/pools/spawn`, `POST /v1/pools/{id}/close` |
 | `log_event`, `session_start` / `session_end` | `POST /v1/events`, `POST /v1/sessions`, `POST /v1/sessions/{id}/end` |
 | `handover_create` / `handover_resume` | `POST /v1/tasks/{id}/handover`, `POST /v1/tasks/{id}/resume` |
@@ -118,7 +124,7 @@ Each LLM role has a provider chain set in `~/.rufur/config.toml`:
 
 | Role | Default chain |
 |---|---|
-| extract, classify, consolidate, verify | `qwen2.5:7b-instruct` → `gpt-oss:120b-cloud` (Ollama cloud) → Groq `llama-3.3-70b-versatile` |
+| extract, classify, consolidate, resolve, verify | `qwen2.5:7b-instruct` → `gpt-oss:120b-cloud` (Ollama cloud) → Groq `llama-3.3-70b-versatile` |
 | probe (forget verification) | `qwen3.5:4b` → `qwen2.5:7b-instruct` |
 | embeddings | `nomic-embed-text` through Ollama |
 

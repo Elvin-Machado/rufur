@@ -131,6 +131,17 @@ export interface Task {
   };
 }
 
+export interface Decision {
+  conflict_id: string;
+  kind: string;
+  question: string;
+  needs_user: boolean;
+  options: { memory_id: string; text: string; source: string; trust: string; agent: string; recorded_at: number; quote: string }[];
+  recommendation: { memory_id: string; reason: string };
+  tried: { step: string; outcome: string }[];
+  default_at: number;
+}
+
 export interface Pool {
   id: string;
   name: string;
@@ -156,6 +167,9 @@ export const api = {
   runs: () => req<{ id: string; trigger: string; started_at: number; finished_at: number | null; stats: any }[]>("GET", "/v1/consolidation/runs"),
   stmStats: () => req<any>("GET", "/v1/stm/stats"),
   scratchPools: () => req<any[]>("GET", "/v1/scratch-pools"),
+  decisions: () => req<Decision[]>("GET", "/v1/decisions"),
+  decide: (id: string, winner: string | null, action: "keep" | "neither" = "keep") =>
+    req<unknown>("POST", `/v1/decisions/${id}`, { action, winner, decided_by: "user" }),
 };
 
 export function until(ts: number): string {

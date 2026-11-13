@@ -36,7 +36,7 @@ export default function App() {
   useEffect(() => {
     api.graph(pool || undefined).then(setGraph);
     api.pools().then(setPools);
-    Promise.all([api.quarantine(), api.memories("?status=disputed")]).then(([q, d]) => setReviewCount(q.length + d.length));
+    Promise.all([api.quarantine(), api.decisions()]).then(([q, d]) => setReviewCount(q.length + d.length));
   }, [version, pool]);
 
   // Live updates: any write, forget or handover anywhere refreshes the views.

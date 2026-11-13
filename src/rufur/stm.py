@@ -35,7 +35,18 @@ def sweep(svc: "MemoryService") -> dict:
     from .write.consolidate import consolidate
 
     t = now()
-    stats: dict = {"consolidated": 0, "archived": 0, "purged": 0, "pools_closed": 0, "events_dropped": 0}
+    stats: dict = {"idle_sessions_extracted": 0, "consolidated": 0, "archived": 0, "purged": 0, "pools_closed": 0,
+                   "events_dropped": 0}  # fmt: skip
+
+    # 0. Sessions that went quiet with unprocessed messages (clients often just quit without ending one).
+    for r in svc.db.all(
+        """SELECT s.id FROM sessions s WHERE s.ended_at IS NULL AND EXISTS (
+               SELECT 1 FROM events e WHERE e.session_id = s.id AND e.extracted = 0)
+           AND (SELECT max(created_at) FROM events e WHERE e.session_id = s.id) < ?""",
+        (t - svc.cfg.session_idle_extract_min * 60,),
+    ):
+        svc.extract_session(r["id"])
+        stats["idle_sessions_extracted"] += 1
 
     # 1. Expiring items nobody has filed yet get consolidated first (LLM, or rules if it's down).
     pending = svc.db.all(
