@@ -58,6 +58,11 @@ def default_roles() -> dict[str, list[ProviderRef]]:
             ("ollama", "gpt-oss:120b-cloud"),
             ("openai_compat", "llama-3.3-70b-versatile", *GROQ),
         ),
+        "forget": _chain(
+            ("ollama", "qwen2.5:7b-instruct"),
+            ("ollama", "gpt-oss:120b-cloud"),
+            ("openai_compat", "llama-3.3-70b-versatile", *GROQ),
+        ),
         "probe": _chain(
             ("ollama", "qwen3.5:4b"),
             ("ollama", "qwen2.5:7b-instruct"),
@@ -96,6 +101,15 @@ class Config:
     min_trust: str = "medium_low"
     recency_half_life_days: float = 30.0
     candidate_k: int = 40
+    # Cross-encoder rerankers (read/rerank.py): "none" | "minilm" | "qwen"
+    fast_reranker: str = "minilm"  # every recall; MiniLM adds ~10-30 ms
+    deep_reranker: str = "qwen"  # forget-by-query: find everything the request covers
+    rerank_top_n: int = 20  # fast-path candidates rescored
+    minilm_reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    qwen_reranker_model: str = "Qwen/Qwen3-Reranker-0.6B"
+    forget_rerank_floor: float = 0.05  # Qwen P(yes) below this is not a forget candidate (kept low: recall first)
+    forget_exhaustive_max: int = 200  # up to this many visible memories, Qwen scores every one, not just search hits
+    forget_judge_max: int = 30  # candidates handed to the LLM that decides what the request covers
 
     # Forgetting
     archive_below: float = 0.15

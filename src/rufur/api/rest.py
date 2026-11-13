@@ -96,6 +96,27 @@ class SpawnIn(BaseModel):
     memory_ids: list[str] = Field(default_factory=list)
     ttl_minutes: int | None = Field(default=None, ge=1, le=24 * 60)
     session_id: str | None = None
+    seed_budget: int = Field(default=2000, ge=100, le=20000)
+
+
+class PoolSearchIn(BaseModel):
+    address: str
+    query: str
+    token_budget: int | None = None
+
+
+class PoolRememberIn(BaseModel):
+    address: str
+    text: str
+    type: str | None = None
+    subject: str = ""
+    predicate: str = ""
+    value: str = ""
+
+
+class PoolAddressIn(BaseModel):
+    address: str
+    summary: str | None = None
 
 
 class CloseIn(BaseModel):
@@ -120,9 +141,11 @@ class ConfirmIn(BaseModel):
 
 class ForgetIn(BaseModel):
     memory_id: str | None = None
+    memory_ids: list[str] | None = None
     query: str | None = None
     confirm: bool = False
     include_history: bool = True
+    cascade_mentions: bool = False
 
 
 class ResumeIn(BaseModel):
@@ -275,7 +298,29 @@ def create_app(service: MemoryService, *, mcp_app=None, mcp_session_manager=None
     @app.post("/v1/pools/spawn")
     def pool_spawn(body: SpawnIn, a: str = A):
         return S.pool_spawn(a, body.purpose, needs=body.needs, memory_ids=body.memory_ids,
-                            ttl_minutes=body.ttl_minutes, session_id=body.session_id)  # fmt: skip
+                            ttl_minutes=body.ttl_minutes, session_id=body.session_id, seed_budget=body.seed_budget)  # fmt: skip
+
+    # Memory addresses (mem://pool/secret) travel in the body: they contain a slash and a secret.
+    @app.post("/v1/pool/search")
+    def pool_search(body: PoolSearchIn, a: str = A):
+        return S.pool_search(a, body.address, body.query, token_budget=body.token_budget)
+
+    @app.post("/v1/pool/remember")
+    def pool_remember(body: PoolRememberIn, a: str = A):
+        return S.pool_remember(a, body.address, body.text, type=body.type, subject=body.subject,
+                               predicate=body.predicate, value=body.value)  # fmt: skip
+
+    @app.post("/v1/pool/fetch")
+    def pool_fetch(body: PoolSearchIn, a: str = A):
+        return S.pool_fetch(a, body.address, body.query)
+
+    @app.post("/v1/pool/info")
+    def pool_info(body: PoolAddressIn, a: str = A):
+        return S.pool_info(a, body.address)
+
+    @app.post("/v1/pool/close")
+    def pool_close_by_address(body: PoolAddressIn, a: str = A):
+        return S.pool_close(a, body.address, summary=body.summary)
 
     @app.post("/v1/pools/{pool_id}/close")
     def pool_close(pool_id: str, body: CloseIn | None = None, a: str = A):
@@ -301,6 +346,18 @@ def create_app(service: MemoryService, *, mcp_app=None, mcp_session_manager=None
     @app.post("/v1/forget")
     def forget(body: ForgetIn, a: str = A):
         return S.forget(a, **body.model_dump())
+
+    @app.get("/v1/forget/receipts")
+    def forget_receipts(limit: int = 50, a: str = A):
+        return S.forget_receipts(a, limit)
+
+    @app.get("/v1/forget/receipts/{receipt_id}")
+    def forget_receipt(receipt_id: str, a: str = A):
+        return S.forget_receipt(a, receipt_id)
+
+    @app.post("/v1/forget/verify")
+    def verify_forgetting(a: str = A):
+        return S.verify_forgetting(a)
 
     # -- handover --------------------------------------------------------
     @app.post("/v1/tasks/{task_id}/handover")

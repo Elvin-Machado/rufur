@@ -44,6 +44,15 @@ It runs as an Ollama-style local daemon on `127.0.0.1:7437`, which serves the RE
   - An agent that writes in bursts or keeps trying to override trusted facts is quarantined automatically.
   - Retrieved memories are always wrapped as data, never instructions.
 
+## How it forgets, and proves it
+
+- **Scope first.** A request like "forget my phone number" matches exact keys before fuzzy search, so it never resolves to a neighbour. It takes every version of that fact and verbatim copies. Other memories that mention the value are listed for the user to confirm (`cascade_mentions`).
+- **Erase in time proportional to what's deleted.** SQLite `secure_delete`, FTS5 `secure-delete` and a WAL truncate zero the bytes at delete time. Events and handover packets are redacted, and conflicts, journals and lineage rows are dropped. A full VACUUM runs only if the byte scan still finds a stale copy on disk.
+- **Probe before and after.** Each probe (id lookups in every table, text scans of every store, recall through every read path, a nearest-neighbour search with the memory's own vector, a raw byte scan of the database, WAL and files) must find the content *before* the delete and nothing after. Probes that couldn't see it beforehand are reported as uninformative, not counted as passes.
+- **Signed receipt.** Each forget issues a receipt with salted hashes, ids and probe outcomes, never the content. It is HMAC-signed with a key kept outside the database and hash-chained to the previous one. `rufur verify-forgetting` (MCP `verify_forgetting`) re-checks the whole chain, confirms the ids are still gone, and that nothing hashing to a tombstone has come back. The nightly sweeper runs the same re-check.
+- **Too private to read is not too private to forget.** If the user asks an agent directly, it can forget a memory above its clearance; the agent sees only `[restricted memory, text hidden]`.
+- `scripts/forget_bench.py`: 20/20 deletion requests completed end to end at 1k, 5k and 20k memories, checked by a different agent through recall, recall_past and a handover. Erasure takes 3–24 ms, against 10–167 ms for the per-forget VACUUM it replaced.
+
 ## Try it
 
 [`docs/TRY_IT.md`](docs/TRY_IT.md) walks through every feature hands-on with copy-paste commands against a throwaway daemon, plus Claude Code and opencode.
@@ -87,6 +96,24 @@ The hooks talk to `http://127.0.0.1:7437`. To use another URL or identity, set `
 ## Use it from opencode
 
 Merge `integrations/opencode/opencode.json` into your opencode config, which adds the `rufur` MCP server as agent `opencode`, and add `integrations/opencode/AGENTS.md` to your instructions. opencode shares the same short-term memory as Claude Code. It doesn't have the automatic hooks, so the instructions tell it when to call the tools.
+
+## Use it from pi
+
+pi has no MCP, so it reaches RUFUR through a skill with a small CLI, plus an extension that handles recall and capture automatically:
+
+```bash
+cp integrations/pi/extensions/rufur.ts ~/.pi/agent/extensions/          # auto recall + capture, agent "pi"
+cp -r integrations/pi/skills/rufur-memory ~/.pi/agent/skills/            # skill + scripts/rufur.py
+```
+
+- **The extension:**
+  - loads the working set on your first prompt
+  - adds relevant memories on every prompt
+  - records your prompts and pi's replies
+  - ends the RUFUR session when the pi session ends
+  - skips `--mode json` runs, which is how pi subagents are spawned
+- **The skill** teaches pi to run `scripts/rufur.py`, which covers recall, past, remember, decisions and resolve, consolidate, forget, spawn and close for subagent pools, and handover and resume.
+- **The skill works without the extension**, but then pi only uses memory when it decides to.
 
 ## MCP tools and REST endpoints
 

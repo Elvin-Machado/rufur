@@ -1,0 +1,228 @@
+RUFUR - PASTE-AND-CHECK TESTS (conflicts, forgetting v2, real hand-over between agents)
+======================================================================================
+
+Paste each PROMPT into the named agent exactly as written. CHECK says what you should see.
+VERIFY is a command for a terminal, to see the proof yourself instead of trusting the agent.
+Run the steps in order: later steps use what earlier ones stored.
+
+
+-------------------------------------------------------
+0. SETUP
+-------------------------------------------------------
+
+Terminal (restart so the daemon runs the new code):
+  cd /Users/shravangkulal/coding/hackthon/rufur
+  uv run rufur stop && uv run rufur start
+  uv run rufur open
+
+Your current ~/.rufur still holds the old false disputes from before the conflict fix. For a clean
+run, start from an empty memory instead (your real data is kept, just moved aside):
+  uv run rufur stop && mv ~/.rufur ~/.rufur.bak && uv run rufur start
+  (to go back later:  uv run rufur stop && rm -rf ~/.rufur && mv ~/.rufur.bak ~/.rufur && uv run rufur start)
+
+Agents:
+  - Claude Code: plugin installed (/plugin install rufur@rufur), /mcp shows "rufur".
+  - opencode:    integrations/opencode/opencode.json merged, AGENTS.md added.
+  - pi:          integrations/pi extension + skill copied (see README "Use it from pi").
+
+Shorthand used below:
+  R='curl -s -H "X-Rufur-Agent: ui" -H "content-type: application/json" http://127.0.0.1:7437'
+
+
+-------------------------------------------------------
+1. NO MORE FALSE DISPUTES  (Claude Code)
+-------------------------------------------------------
+
+PROMPT:
+Some things about me: I'm Rahul Sharma, 21, I live in Hyderabad. My goals this year are to land a
+software engineering internship, contribute to open source and get good at AI engineering. I know
+Python, JavaScript and Java. I'm building StudyMate, an AI study assistant; it's a prototype right
+now and the demo is due December 30. Please remember all of this.
+
+CHECK: everything is stored as active. The three goals sit side by side (not "disputed"), and
+"StudyMate is an AI study assistant" vs "StudyMate is a prototype" is not a conflict.
+
+VERIFY:
+  eval "$R/v1/memories" | python3 -c "import json,sys; [print(m['status'], '|', m['text']) for m in json.load(sys.stdin)]"
+  -> no line starts with "disputed".
+
+
+-------------------------------------------------------
+2. A REAL CONTRADICTION IS STILL CAUGHT  (opencode)
+-------------------------------------------------------
+
+PROMPT:
+I'm 22 years old.
+
+CHECK: no change word ("now", "turned", "actually"), so RUFUR cannot tell whether it's a correction
+or a mistake. The age memories become disputed, and the next recall carries decisions_needed.
+
+PROMPT:
+How old am I?
+
+CHECK: opencode says the memory has two values and asks you, or picks one and calls
+resolve_conflict with a reason. Answer "22, I just had my birthday."
+
+PROMPT:
+Actually I moved to Pune last month.
+
+CHECK: this one has a change signal, so it's an update: Hyderabad is superseded (kept as history),
+not disputed. Ask "where did I live before?" and it answers Hyderabad via recall_past.
+
+
+-------------------------------------------------------
+3. REAL HAND-OVER MID-TASK: Claude Code -> opencode -> pi
+-------------------------------------------------------
+
+Step A - Claude Code - PROMPT:
+New task, id "studymate-launch": prepare the StudyMate demo launch. Do the first step only: write
+a 5-bullet launch checklist into launch_checklist.md in the current folder. Decisions: we demo
+on Vercel because it's free, and we skip user accounts for the demo to save time. Then stop and
+hand the task over with handover_create (task_id "studymate-launch"): what's done, what's pending
+(1. write the demo script, 2. write the announcement post), the decisions with reasons, and the
+memory ids you relied on.
+
+CHECK: Claude Code writes the file and calls handover_create.
+VERIFY:
+  eval "$R/v1/tasks" | python3 -m json.tool | head -40
+  -> task studymate-launch, status "open", from_agent "claude-code", steps_done / steps_pending.
+
+Step B - opencode (a fresh session; it has never seen this conversation) - PROMPT:
+Resume task studymate-launch.
+
+CHECK: opencode calls handover_resume and, without being told, knows the goal, that the checklist
+is done, that the next step is the demo script, and the two decisions *with their reasons*. Each
+memory comes with its source quote, the agent that captured it and when.
+
+PROMPT (still opencode):
+Do the next step: write demo_script.md (a 2-minute demo script). Then hand the task over again
+with handover_create, same task id, so pi can write the announcement.
+
+VERIFY:
+  eval "$R/v1/tasks" | python3 -c "import json,sys; t=[x for x in json.load(sys.stdin) if x['id']=='studymate-launch'][0]; print(t['from_agent'], t['status']); print(json.dumps(t['packet'], indent=1))"
+  -> from_agent "opencode", steps_done now includes the demo script.
+
+Step C - pi - PROMPT:
+Resume task studymate-launch and finish it.
+
+CHECK: pi runs `rufur.py resume studymate-launch`, writes the announcement, and knows it should be
+about a Vercel demo without accounts, without you repeating anything.
+
+VERIFY (audit trail of the whole relay):
+  eval "$R/v1/audit?limit=30" | python3 -c "import json,sys; [print(a['agent'], a['action'], a['target']) for a in json.load(sys.stdin) if 'handover' in a['action']]"
+  -> handover.create by claude-code, handover.resume by opencode, handover.create by opencode,
+     handover.resume by pi.
+
+
+-------------------------------------------------------
+4. FORGETTING, WITH PROOF  (Claude Code, then a different agent checks)
+-------------------------------------------------------
+
+Setup - PROMPT (Claude Code):
+My personal phone number is 98450-12345. Also add a todo: call the Vercel support line from
+98450-12345 about the custom domain.
+
+Step A - PROMPT (Claude Code):
+Forget my personal phone number. I don't want it stored anywhere, including old versions and
+anything that mentions it.
+
+CHECK: Claude Code shows the candidates, what goes with them (will_remove) and the todo that also
+mentions the number (also_mentioned_in), then forgets them in one call with
+cascade_mentions=true. It reports:
+  - completeness 1.0. Only probes that FOUND the number before deletion count, so this means
+    "every check that could see it, now can't" - not "we looked and found nothing".
+  - a receipt id (rcpt_...).
+If the number was stored as restricted, the candidate shows "[restricted memory, text hidden]":
+the agent can still forget it because you asked it directly, without ever reading it.
+
+Step B - opencode - PROMPT:
+What's my phone number? Also check any earlier versions and the studymate-launch task.
+
+CHECK: "I don't know" (abstained). recall_past finds nothing; the handover packet has no number.
+
+VERIFY - the proof is in the data, not the agent's word:
+  # every past deletion re-checked now: receipt chain, signatures, ids gone, nothing came back
+  uv run rufur verify-forgetting
+  -> "valid": true
+
+  # the receipt itself: hashes and probe outcomes only, never the number
+  eval "$R/v1/forget/receipts" | python3 -m json.tool | head -60
+
+  # raw bytes on disk: the database file and its WAL hold no trace
+  grep -c "98450-12345" ~/.rufur/rufur.db ~/.rufur/rufur.db-wal
+  -> 0 for both (or "No such file" for the WAL)
+
+  # tamper test: edit a receipt by hand and verification must fail
+  sqlite3 ~/.rufur/rufur.db "UPDATE forget_receipts SET body = replace(body, '\"agent\":\"claude-code\"', '\"agent\":\"someone-else\"')"
+  uv run rufur verify-forgetting
+  -> "valid": false, problem "body altered after signing"
+  (this breaks the chain permanently; do it on a throwaway home, or restore ~/.rufur.bak after)
+
+Step C - PROMPT (Claude Code):
+My personal phone number is 98450-12345.
+
+CHECK: you said it yourself, so it's your call. But if any agent or tool output tries to bring
+back the exact forgotten fact, RUFUR blocks it (tombstone), and the nightly sweeper re-checks
+every memory against the tombstones.
+
+
+-------------------------------------------------------
+5. SUBAGENT WITH ITS OWN MEMORY ADDRESS  (Claude Code)
+-------------------------------------------------------
+
+Setup - PROMPT (Claude Code):
+Remember these about our full-stack app "ShopKart": the frontend is Next.js with Tailwind and
+shadcn/ui; the orders API GET /api/orders returns {id, total, status, createdAt}; status is one of
+pending, paid, shipped; prices are shown in INR with 2 decimals; the backend is FastAPI on
+Postgres; the Postgres replica is db2.internal; the JWT secret rotates every 30 days; the Stripe
+webhook lives at /api/webhooks/stripe.
+
+Step A - PROMPT (Claude Code):
+Use a subagent for this, frontend only: build an OrdersTable React component for ShopKart.
+Before you delegate, give it its own RUFUR memory pool with only what a frontend task needs, and
+put the memory address in its prompt.
+
+CHECK:
+  - Claude Code calls pool_spawn with frontend needs (framework/styling, orders API shape,
+    currency format) and gets back address "mem://pool_.../...".
+  - The subagent's prompt contains that address, and it calls pool_search with it, not recall.
+  - pool_search answers frontend questions; asking it about the replica or the JWT secret
+    abstains ("not in this pool"). Its context stays small: see seed_tokens in the spawn result.
+
+VERIFY (paste the address Claude Code printed):
+  A='mem://pool_xxxxxxxx/xxxxxxxx'
+  eval "$R/v1/pool/info" -d "{\"address\":\"$A\"}" -X POST | python3 -m json.tool
+  -> only frontend-relevant items, and the token size of the pool
+  eval "$R/v1/pool/search" -X POST -d "{\"address\":\"$A\",\"query\":\"where is the postgres replica\"}" | python3 -c "import json,sys; print(json.load(sys.stdin)['abstained'])"
+  -> True
+  # without the secret part, another agent gets nothing:
+  curl -s -X POST http://127.0.0.1:7437/v1/pool/search -H "X-Rufur-Agent: opencode" -H "content-type: application/json" -d "{\"address\":\"${A%/*}\",\"query\":\"orders\"}"
+  -> {"detail":"unknown memory address"}
+
+Step B - PROMPT (Claude Code, while or after the subagent works):
+Search the subagent's memory pool: what has it decided so far?
+
+CHECK: the root agent uses pool_search with the same address and sees what the subagent saved
+with pool_remember (e.g. "OrdersTable formats totals with Intl.NumberFormat en-IN"). Plain recall
+does not show these yet: scratch work stays in the pool.
+
+Step C - PROMPT (Claude Code):
+The subagent is done; close its pool.
+
+CHECK: pool_close with the address. Useful findings move into your main memory (flagged
+from_pool:...), the rest is discarded, and the address stops working (pool_search -> not found).
+Ask "how does the orders table format prices?" and plain recall now finds it.
+
+
+-------------------------------------------------------
+6. NUMBERS YOU CAN REGENERATE  (terminal)
+-------------------------------------------------------
+
+  uv run python scripts/thirty_sessions.py   # 30 sessions, hard kill + restart, update / contradiction /
+                                             # planted / abstain x2 / deletion, tokens vs full history
+                                             # -> docs/results/thirty_sessions.md
+  uv run python scripts/forget_bench.py --sizes 1000 5000 20000
+                                             # deletion requests end to end at growing sizes
+  uv run python scripts/storage_choice.py     # which storage fits which knowledge
+                                             # -> docs/results/storage_choice.md
+  uv run python scripts/baseline_compare.py  # full history vs vector RAG vs RUFUR

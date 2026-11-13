@@ -48,14 +48,14 @@ Use `confirm_memory(id)` only to approve or reject one specific memory. Approvin
 
 ## Subagents
 Before delegating with the Task/Agent tool:
-1. Call `pool_spawn(purpose, needs=[...queries describing what the subagent needs...], session_id=<RUFUR session from your context>)`.
-2. Put the returned `scoped_key` in the subagent's prompt. Tell it to use RUFUR with that key (`Authorization: Bearer <key>`) or to report findings back to you. The subagent sees **only** the seeded memories plus its own writes.
-3. When it's done, call `pool_close(pool_id, summary?)`. Its useful findings go back into the user's short-term memory, with provenance, and the rest is discarded.
+1. Call `pool_spawn(purpose, needs=[...], session_id=<RUFUR session from your context>)`. `needs` are queries for exactly what the task needs (for a frontend task: framework and styling, the API contract it calls, design decisions) and nothing it shouldn't care about (database internals). The seed stays within `seed_budget` tokens.
+2. Put the returned `address` (`mem://...`) in the subagent's prompt, e.g. "Your memory address is mem://...; use `pool_search`, `pool_remember` and `pool_fetch` with it instead of recall." Searching with the address sees **only** the seeded memories plus what was written to the pool, so the subagent's context stays small. You can `pool_search` the same address to check its progress. If it needs something the seed missed, `pool_fetch` adds it.
+3. When it's done, call `pool_close(address, summary?)`. Its useful findings go back into the user's short-term memory, with provenance, and the rest is discarded.
 
 Pools you forget to close are closed automatically when they expire or when the subagent stops.
 
 ## Forgetting
-When the user asks to forget something, call `forget(query=...)`. It returns candidates. Confirm with the user, then call `forget(memory_id=...)` for each one. Report the verification result: the completeness percentage and which checks passed.
+When the user asks to forget something, call `forget(query=...)`. It returns `candidates`, `will_remove` (every version that goes with them) and `also_mentioned_in` (other memories that mention the value). Show these to the user, then call `forget(memory_ids=[...])` once with the ones they mean; add `cascade_mentions=true` if they also want the mentions gone. Report the result: completeness (probes that saw the fact before deletion and find nothing after), any `still_mentioned_in`, and the receipt id. `verify_forgetting` re-checks every past deletion at any time.
 
 ## Handing over
 If you have to stop mid-task, call `handover_create(task_id, goal, steps_done, steps_pending, decisions)` so another agent can `handover_resume(task_id)`.

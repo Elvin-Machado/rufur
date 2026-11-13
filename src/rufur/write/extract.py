@@ -53,7 +53,8 @@ Rules:
   Never include the event tag or role. Never paraphrase or fix typos.
 - `text`: one self-contained third-person sentence ("The user prefers ...", "The team decided ...").
 - `subject` + `predicate` form a stable key so the same fact always gets the same key.
-  `subject`: who/what it is about; use "user" for the human. `predicate`: a short attribute NOUN
+  `subject`: who/what it is about; use "user" for the human, even after they tell you their name
+  (their name itself is subject "user", predicate "name"). `predicate`: a short attribute NOUN
   phrase such as "home city", "preferred theme", "database choice", "deadline" (not a verb like "lives in").
   `value`: just the value ("Bangalore", "dark mode").
 - `type`: fact | preference | decision | event | relation | table | procedure.

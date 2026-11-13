@@ -8,7 +8,7 @@ them in place into long-term stores.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..config import Config
@@ -68,6 +68,22 @@ class WritePath:
             return self.embedder.embed([text])[0]
         except EmbedUnavailable:
             return None
+
+    def _user_alias(self, subject: str, pools: list[str]) -> bool:
+        """True if `subject` is the user's own name ("Rahul Sharma" or just "Rahul"), so it means "user"."""
+        key = norm_key(subject)
+        if not key or key == "user":
+            return False
+        marks = ",".join("?" * len(pools))
+        for r in self.db.all(
+            f"SELECT value FROM memories WHERE pool_id IN ({marks}) AND subject = 'user' "
+            "AND predicate IN ('name', 'full name', 'user name') AND status IN ('active', 'disputed')",
+            tuple(pools),
+        ):
+            name = norm_key(r["value"])
+            if key == name or (name and key == name.split()[0]):
+                return True
+        return False
 
     def _trust(self, source_type: str, agent: dict) -> str:
         if source_type == "agent":
@@ -140,6 +156,10 @@ class WritePath:
         `candidate_pools` are where conflicts are looked for: for an STM write, the user's STM plus
         the long-term pool it will be promoted into.
         """
+        if self._user_alias(claim.subject, candidate_pools or [pool_id]):
+            # One person, one key space: otherwise "rahul sharma|age" and "user|age" never meet as a key match
+            # and only collide as fuzzy vector neighbours.
+            claim = replace(claim, subject="user")
         if tombstone.is_tombstoned(self.db, claim.subject, claim.predicate, claim.value, claim.text):
             self.ledger.audit(agent["name"], "write.blocked_tombstone", None)
             return CommitResult(None, "tombstoned")
@@ -165,11 +185,14 @@ class WritePath:
             (self.db.scalar("SELECT content FROM events WHERE id = ?", (eid,)) or q) for eid, q in sources
         )
         for existing, how in candidates:
-            verdict, tokens = conflict.classify(self.llm, existing, claim.text, how, claim.value, evidence)
+            verdict, tokens = conflict.classify(self.llm, existing, claim.text, how, claim.value, evidence, claim.subject, claim.predicate)
             llm_tokens += tokens
             if verdict.outcome == "duplicate":
                 return self._corroborate(existing, claim, agent, source_type, trust, sources, llm_tokens)
             if verdict.outcome == "unrelated":
+                continue
+            if verdict.outcome == "coexist":
+                related.append({"id": existing["id"], "outcome": "coexist", "reason": verdict.reason})
                 continue
             related.append({"id": existing["id"], "outcome": verdict.outcome, "reason": verdict.reason})
             if verdict.outcome == "update":

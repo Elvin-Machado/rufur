@@ -38,8 +38,9 @@ You have a memory tool called RUFUR (MCP server "rufur"). It is my memory, share
   only if needs_user is true or you really can't tell; then pass decided_by="user".
 - Before delegating to a subagent, call pool_spawn with what it needs and give it the returned key.
   Call pool_close when it's done.
-- When I ask you to forget something: call forget with a query, show me the candidates, then
-  forget by id and tell me the verification result.
+- When I ask you to forget something: call forget with a query and show me the candidates,
+  will_remove and also_mentioned_in. Then call forget once with memory_ids=[...] for the ones I mean
+  (cascade_mentions=true if I want the mentions gone too) and tell me the completeness and receipt id.
 - When a task is done, call consolidate.
 ----- END RULES TEXT -----
 

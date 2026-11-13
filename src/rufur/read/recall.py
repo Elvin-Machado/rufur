@@ -12,6 +12,7 @@ from typing import Callable
 from ..db.conn import Database
 from ..textutil import content_words, estimate_tokens, now
 from ..write.trust import TRUST_WEIGHT
+from .rerank import RerankUnavailable
 from .search import Candidate, Filter, search
 
 ABSTAIN_TEXT = "No stored memory answers this."
@@ -149,12 +150,24 @@ Verifier = Callable[[str, list[tuple[str, str]]], "set[str] | None"]
 def fast_recall(db: Database, embedder, query: str, flt: Filter, *, token_budget: int, threshold: float,
                 half_life_days: float, k: int, verifier: Verifier | None = None,
                 verify_band: tuple[float, float] = (0.2, 0.6), exclude: set[str] | None = None,
-                header: str = CONTEXT_HEADER) -> RecallResult:  # fmt: skip
+                header: str = CONTEXT_HEADER, reranker=None, rerank_top_n: int = 20) -> RecallResult:  # fmt: skip
     started = time.perf_counter()
     path = "fast"
     cands, used_vec = search(db, embedder, query, flt, k=k)
     qwords = content_words(query)
     idf = idf_weights(db, qwords) if cands else {}
+
+    # A cross-encoder reads query and memory together, so it can tell "answers the question" from "shares its
+    # words". It rescores the top fused candidates; the rest count as unconfirmed (score 0).
+    rerank: dict[str, float] | None = None
+    if reranker is not None and cands:
+        top = [c for c in cands if not (exclude and c.memory["id"] in exclude)][:rerank_top_n]
+        try:
+            scores = reranker.score(query, [c.chunk_text or c.memory["text"] for c in top])
+            rerank = {c.memory["id"]: s for c, s in zip(top, scores)}
+            path = "fast+rerank"
+        except RerankUnavailable:
+            pass
 
     scored: list[tuple[float, float, Candidate]] = []
     t = now()
@@ -162,6 +175,8 @@ def fast_recall(db: Database, embedder, query: str, flt: Filter, *, token_budget
         if exclude and c.memory["id"] in exclude:
             continue
         rel = relevance(qwords, c, embedder, idf)
+        if rerank is not None:
+            rel = 0.5 * rel + 0.5 * rerank.get(c.memory["id"], 0.0)
         m = c.memory
         s = rel * recency(m, half_life_days) * TRUST_WEIGHT[m["trust"]] * (0.5 + 0.5 * m["importance"])
         if m["status"] == "disputed":
@@ -182,7 +197,7 @@ def fast_recall(db: Database, embedder, query: str, flt: Filter, *, token_budget
         shortlist = [c for _, rel, c in scored[:6] if rel >= low]
         verdict = verifier(query, [(c.memory["id"], c.memory["text"]) for c in shortlist])
         if verdict is not None:
-            path = "fast+verify"
+            path += "+verify"
             scored = [t for t in scored if t[2].memory["id"] in verdict]
             # Verified items pass regardless of their lexical score.
             threshold = 0.0

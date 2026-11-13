@@ -345,3 +345,108 @@ def test_new_tools_have_rest_and_mcp_parity(service, client):
     assert scrub(via_mcp) == scrub(via_rest)
     spawned = call(server, "pool_spawn", {"purpose": "test", "needs": ["home city"]})
     assert client.post(f"/v1/pools/{spawned['pool_id']}/close", json={}, headers={"X-Rufur-Agent": "ui"}).status_code == 200
+
+
+def test_memory_address_gives_a_small_searchable_pool_to_root_and_subagent(cfg):
+    from rufur.service import NotFound
+
+    svc = make(cfg, lambda items: [{"id": i, "store": "fact", "importance": 0.8} for i, _ in items])
+    try:
+        fact(svc, "The frontend uses React with Tailwind", "frontend", "framework", "React + Tailwind", agent="claude-code")
+        fact(svc, "The orders API returns JSON with id, total and status", "orders api", "response shape",
+             "id, total, status", agent="claude-code")  # fmt: skip
+        fact(svc, "The Postgres replica runs on db2.internal", "postgres", "replica host", "db2.internal", agent="claude-code")
+        spawn = svc.pool_spawn("claude-code", "build the orders page (frontend only)",
+                               needs=["frontend framework", "orders API response"], seed_budget=200)  # fmt: skip
+        addr = spawn["address"]
+        assert addr.startswith("mem://") and spawn["seed_tokens"] <= 200
+        # Subagent (same identity as its parent, as in Claude Code) and root both search the pool by address.
+        assert "React" in svc.pool_search("claude-code", addr, "which frontend framework")["context"]
+        assert svc.pool_search("claude-code", addr, "where does the postgres replica run")["abstained"]  # not seeded
+        # The address is the capability: another agent can use it, without it nothing.
+        assert not svc.pool_search("opencode", addr, "orders API response")["abstained"]
+        with pytest.raises(NotFound):
+            svc.pool_search("opencode", addr.rsplit("/", 1)[0], "orders API response")
+        # Missed something: the memory layer fetches it into the pool.
+        assert svc.pool_fetch("claude-code", addr, "postgres replica host")["added"]
+        assert "db2" in svc.pool_search("claude-code", addr, "where does the postgres replica run")["context"]
+        svc.pool_remember("claude-code", addr, "The orders page polls the API every 30 seconds", subject="orders page",
+                          predicate="refresh interval", value="30 seconds")  # fmt: skip
+        assert svc.recall("claude-code", "how often does the orders page refresh")["abstained"]  # still pool-only
+        svc.pool_close("claude-code", addr)
+        assert not svc.recall("claude-code", "how often does the orders page refresh")["abstained"]
+        with pytest.raises(NotFound):
+            svc.pool_search("claude-code", addr, "anything")  # closed address stops working
+    finally:
+        svc.close()
+
+
+# ------------------------------------------------------------------ rerankers
+
+
+class FakeReranker:
+    """Scores by keyword: 0.9 if any keyword is in the doc, else 0.01."""
+
+    name = "fake"
+
+    def __init__(self, *keywords):
+        self.keywords = keywords
+        self.calls = 0
+
+    def score(self, query, docs, instruction=None):
+        self.calls += 1
+        return [0.9 if any(k in d.lower() for k in self.keywords) else 0.01 for d in docs]
+
+
+def test_forget_by_query_uses_reranker_then_judge(cfg):
+    def judge(role, prompt):
+        if role != "forget" or "MEMORIES:" not in prompt:
+            return None  # question rewrite unavailable: falls back to the request minus its verb
+        items = re.findall(r"id=(\S+): (.*)", prompt)
+        # Forget the address, keep the cafe that only shares the street name and the dog the "I" key-matched.
+        return {"items": [{"id": i, "forget": "lives at" in t, "reason": "x"} for i, t in items]}
+
+    svc = make(cfg, extra=judge)
+    try:
+        home = fact(svc, "The user lives at 12 Baker Street.", "user", "home address", "12 Baker Street")["memory"]["id"]
+        fact(svc, "Baker Street Cafe is the user's favourite restaurant.", "baker street cafe", "category", "restaurant")
+        other = fact(svc, "The user's dog is called Bruno.", "user", "dog name", "Bruno")["memory"]["id"]
+        unrelated = fact(svc, "Project Atlas ships on Friday.", "project atlas", "ship date", "Friday")["memory"]["id"]
+        svc.deep_reranker = FakeReranker("baker")
+        pre = svc.forget("ui", query="forget where I live")
+        assert pre["search"]["reranker"] == "fake" and pre["search"]["judge"] == "llm"
+        assert pre["search"]["scope"] == "exhaustive"
+        by_id = {c["id"]: c for c in pre["candidates"]}
+        assert unrelated not in by_id  # below the rerank floor and not key-matched: never offered
+        # "I" key-matches every user fact, so the dog reaches the judge despite its low score; the judge keeps it.
+        assert by_id[other]["match"] == "key" and by_id[other]["decision"] == "keep"
+        assert by_id[home]["decision"] == "forget"
+        assert [c["decision"] for c in pre["candidates"] if "restaurant" in c["text"]] == ["keep"]
+        out = svc.forget("ui", query="forget where I live", confirm=True)
+        assert [f["id"] for f in out["forgotten"]] == [home]
+        assert svc.ledger.get_memory(other) is not None
+    finally:
+        svc.close()
+
+
+def test_forget_falls_back_without_reranker(cfg):
+    svc = make(cfg)
+    try:
+        fact(svc, "The user lives at 12 Baker Street.", "user", "home address", "12 Baker Street")
+        pre = svc.forget("ui", query="forget my home address")
+        assert pre["search"]["reranker"] is None and pre["candidates"]
+    finally:
+        svc.close()
+
+
+def test_fast_recall_reranker_reorders(cfg):
+    svc = make(cfg)
+    try:
+        fact(svc, "The user's favourite colour is blue.", "user", "favourite colour", "blue")
+        fact(svc, "The user's car colour is red.", "user", "car colour", "red")
+        svc.fast_reranker = FakeReranker("car")
+        res = svc.recall("ui", "what colour is the user's car?", verify=False)
+        assert res["path"].startswith("fast+rerank")
+        assert "car" in res["items"][0]["text"]
+    finally:
+        svc.close()

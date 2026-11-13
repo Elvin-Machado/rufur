@@ -205,6 +205,20 @@ def sweep():
     typer.echo(json.dumps(out, indent=2))
 
 
+@app.command("verify-forgetting")
+def verify_forgetting():
+    """Re-check every deletion receipt: chain, signatures, ids still gone, nothing resurfaced."""
+    cfg = load_config()
+    out = _call(cfg, "POST", "/v1/forget/verify")
+    if out is None:
+        from ..service import MemoryService
+
+        out = MemoryService(cfg).verify_forgetting("ui")
+    typer.echo(json.dumps(out, indent=2))
+    if not out["valid"]:
+        raise typer.Exit(1)
+
+
 @app.command("tune-stm")
 def tune_stm():
     """Suggest the short-term TTL from how old STM items are when they get reused."""

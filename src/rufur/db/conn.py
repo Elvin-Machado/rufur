@@ -29,6 +29,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("pools", "owner_session", "TEXT"),
     ("pools", "expires_at", "REAL"),
     ("pools", "purpose", "TEXT"),
+    ("pools", "cap_hash", "TEXT"),  # sha256 of the secret part of the pool's memory address
     ("memories", "tier", "TEXT NOT NULL DEFAULT 'ltm'"),  # stm | ltm
     ("memories", "store", "TEXT NOT NULL DEFAULT 'fact'"),  # profile | fact | table | graph | procedure | journal | discard
     ("memories", "target_pool", "TEXT"),  # long-term pool an STM item is promoted into
@@ -85,6 +86,10 @@ class Database:
             )
             if stored is None:
                 self.set_meta("embed_dim", str(self.embed_dim))
+            # FTS5 normally leaves deleted terms in old index segments until a merge; secure-delete removes
+            # them at delete time, so a forget needn't rebuild the index (persistent per-table setting).
+            for fts in ("memories_fts", "chunks_fts"):
+                self.conn.execute(f"INSERT INTO {fts}({fts}, rank) VALUES('secure-delete', 1)")
 
     # -- helpers -----------------------------------------------------------
 
@@ -137,6 +142,12 @@ class Database:
             self.conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('optimize')")
             self.conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
             self.conn.execute("VACUUM")
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def scrub(self) -> None:
+        """Push a delete's zeroed pages out of the WAL and truncate it. With secure_delete and FTS5
+        secure-delete on, this is all a forget needs: cost scales with what was deleted, not the file."""
+        with self.lock:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def close(self) -> None:

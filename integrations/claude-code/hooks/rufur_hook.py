@@ -89,7 +89,7 @@ def _last_assistant_text(transcript_path: str) -> str | None:
 SESSION_NOTE = (
     "RUFUR memory is active (session {sid}). Relevant memories are added to your context automatically; use the "
     "rufur MCP tools for more (recall, recall_past) and to save decisions (remember). Before delegating to a "
-    "subagent, call pool_spawn with session_id=\"{sid}\" and hand it the returned key."
+    "subagent, call pool_spawn with session_id=\"{sid}\" and put the returned memory address in its prompt."
 )
 
 

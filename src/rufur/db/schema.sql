@@ -228,6 +228,17 @@ CREATE TABLE IF NOT EXISTS metrics (
     created_at REAL NOT NULL
 );
 
+-- Signed, hash-chained deletion receipts. Hashes, ids and probe outcomes only, never the forgotten content.
+CREATE TABLE IF NOT EXISTS forget_receipts (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         TEXT NOT NULL UNIQUE,
+    prev_hash  TEXT NOT NULL,
+    hash       TEXT NOT NULL,
+    sig        TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 -- Identifiers and hashes only, never deleted content.
 CREATE TABLE IF NOT EXISTS audit (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

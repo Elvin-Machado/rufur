@@ -27,8 +27,9 @@ consolidation).
   genuinely can't tell and it matters; then pass decided_by="user". Never block a task waiting on it.
 - Call `remember` for decisions, preferences and facts worth keeping (source="user" when relaying what the
   user said). Call `consolidate` after finishing a task so today's memory is filed long-term.
-- Before delegating to a subagent, call `pool_spawn` with what it needs and pass it the returned key; call
-  `pool_close` when it's done so its useful findings come back.
+- Before delegating to a subagent, call `pool_spawn` with what it needs and put the returned memory `address`
+  in its prompt; it uses pool_search / pool_remember / pool_fetch with it. Call `pool_close` when it's done.
+- If you were given a memory address (mem://...), use pool_search on it instead of recall.
 - When the user asks you to forget something, call `forget` (with a query it returns candidates first).
 - Before stopping mid-task, call `handover_create` so another agent can `handover_resume`."""
 
@@ -66,6 +67,7 @@ class RemoteBackend:
             "inspect": ("GET", f"/v1/memories/{kw.get('memory_id')}", None),
             "confirm_memory": ("POST", f"/v1/memories/{kw.get('memory_id')}/confirm", {"action": kw.get("action")}),
             "forget": ("POST", "/v1/forget", kw),
+            "verify_forgetting": ("POST", "/v1/forget/verify", None),
             "log_event": ("POST", "/v1/events", kw),
             "session_start": ("POST", "/v1/sessions", kw),
             "session_end": ("POST", f"/v1/sessions/{kw.get('session_id')}/end", None),
@@ -75,7 +77,13 @@ class RemoteBackend:
             "recall_past": ("POST", "/v1/recall/past", kw),
             "consolidate": ("POST", "/v1/consolidate", kw),
             "pool_spawn": ("POST", "/v1/pools/spawn", kw),
-            "pool_close": ("POST", f"/v1/pools/{kw.get('pool_id')}/close", {"summary": kw.get("summary")}),
+            "pool_close": (("POST", "/v1/pool/close", {"address": kw.get("pool_id"), "summary": kw.get("summary")})
+                           if str(kw.get("pool_id", "")).startswith("mem://")
+                           else ("POST", f"/v1/pools/{kw.get('pool_id')}/close", {"summary": kw.get("summary")})),
+            "pool_search": ("POST", "/v1/pool/search", kw),
+            "pool_remember": ("POST", "/v1/pool/remember", kw),
+            "pool_fetch": ("POST", "/v1/pool/fetch", kw),
+            "pool_info": ("POST", "/v1/pool/info", kw),
             "pending_decisions": ("GET", "/v1/decisions", None),
             "resolve_conflict": ("POST", f"/v1/decisions/{kw.get('conflict_id')}",
                                  {k: v for k, v in kw.items() if k != "conflict_id"}),
@@ -138,10 +146,21 @@ def build_mcp(backend: Backend, *, default_agent: str = "claude-code", resolve_k
         return backend.call("confirm_memory", who(ctx), memory_id=memory_id, action=action)
 
     @mcp.tool()
-    def forget(ctx: Context, memory_id: str | None = None, query: str | None = None, confirm: bool = False) -> dict:
-        """Permanently forget a memory and everything derived from it, then verify with probes.
-        With `query` and confirm=false, returns candidates to confirm first."""
-        return backend.call("forget", who(ctx), memory_id=memory_id, query=query, confirm=confirm)
+    def forget(ctx: Context, memory_id: str | None = None, memory_ids: list[str] | None = None, query: str | None = None,
+               confirm: bool = False, cascade_mentions: bool = False) -> dict:  # fmt: skip
+        """Permanently forget a memory, every version of it and everything derived from it, then prove it with
+        probes run before and after the delete. Returns a signed receipt.
+        With `query`: returns candidates plus what would go with them; show them to the user, then call again
+        with `memory_ids` for the ones they mean. If the user also wants the `also_mentioned_in` memories gone, pass
+        cascade_mentions=true in that same call (so the value is scrubbed from transcripts and handovers too)."""
+        return backend.call("forget", who(ctx), memory_id=memory_id, memory_ids=memory_ids, query=query, confirm=confirm,
+                            cascade_mentions=cascade_mentions)  # fmt: skip
+
+    @mcp.tool()
+    def verify_forgetting(ctx: Context) -> dict:
+        """Re-verify every past deletion: receipt chain and signatures intact, forgotten ids still absent,
+        nothing forgotten has resurfaced."""
+        return backend.call("verify_forgetting", who(ctx))
 
     @mcp.tool()
     def log_event(content: str, ctx: Context, role: Literal["user", "assistant", "tool", "document", "web"] = "user",
@@ -193,15 +212,42 @@ def build_mcp(backend: Backend, *, default_agent: str = "claude-code", resolve_k
 
     @mcp.tool()
     def pool_spawn(purpose: str, ctx: Context, needs: list[str] | None = None, memory_ids: list[str] | None = None,
-                   ttl_minutes: int | None = None, session_id: str | None = None) -> dict:  # fmt: skip
-        """Create a temporary memory pool for a subagent, seeded with only what it needs (`needs` are queries).
-        Returns `scoped_key`: give it to the subagent so its RUFUR calls see only this pool. Close with pool_close."""
+                   ttl_minutes: int | None = None, session_id: str | None = None, seed_budget: int = 2000) -> dict:  # fmt: skip
+        """Before delegating: create a small memory pool for a subagent, seeded (within `seed_budget` tokens) with
+        only what its task needs. `needs` are queries, e.g. ["frontend framework and styling", "API contract for
+        /orders"]; leave out what it must not care about. Returns `address` (mem://...): put it in the subagent's
+        prompt. Both of you then use pool_search / pool_remember / pool_fetch with it. Close with pool_close."""
         return backend.call("pool_spawn", who(ctx), purpose=purpose, needs=needs or [], memory_ids=memory_ids or [],
-                            ttl_minutes=ttl_minutes, session_id=session_id)  # fmt: skip
+                            ttl_minutes=ttl_minutes, session_id=session_id, seed_budget=seed_budget)  # fmt: skip
+
+    @mcp.tool()
+    def pool_search(address: str, query: str, ctx: Context, token_budget: int | None = None) -> dict:
+        """Search ONLY the memory pool at `address` (mem://...): what was seeded for this task plus what was written
+        to it. Use this instead of recall when you were given a memory address."""
+        return backend.call("pool_search", who(ctx), address=address, query=query, token_budget=token_budget)
+
+    @mcp.tool()
+    def pool_remember(address: str, text: str, ctx: Context, subject: str = "", predicate: str = "",
+                      value: str = "") -> dict:  # fmt: skip
+        """Save a finding into the memory pool at `address`. It comes back to the main memory on pool_close if useful."""
+        return backend.call("pool_remember", who(ctx), address=address, text=text, subject=subject,
+                            predicate=predicate, value=value)  # fmt: skip
+
+    @mcp.tool()
+    def pool_fetch(address: str, query: str, ctx: Context) -> dict:
+        """pool_search found nothing but you need it: ask the memory layer to look in the user's memory and add the
+        matches to this pool (within a small budget). Then pool_search again."""
+        return backend.call("pool_fetch", who(ctx), address=address, query=query)
+
+    @mcp.tool()
+    def pool_info(address: str, ctx: Context) -> dict:
+        """What the memory pool at `address` holds (purpose, items, token size)."""
+        return backend.call("pool_info", who(ctx), address=address)
 
     @mcp.tool()
     def pool_close(pool_id: str, ctx: Context, summary: str | None = None) -> dict:
-        """Close a subagent's pool: its important findings go back to the user's memory, the rest is discarded."""
+        """Close a subagent's pool (pool id or its mem:// address): important findings go back to the user's memory,
+        the rest is discarded and the address stops working."""
         return backend.call("pool_close", who(ctx), pool_id=pool_id, summary=summary)
 
     @mcp.tool()

@@ -208,3 +208,47 @@ def test_forget_with_journal_leaves_other_memories_alone(cfg):
                              (budget,)) == "The budget is 80k"  # fmt: skip
     finally:
         svc.close()
+
+
+def test_multi_valued_attributes_coexist(cfg):
+    svc = make(cfg)
+    try:
+        a = say(svc, "ui", "The user wants a software engineering internship", "internship", subject="user", predicate="goal")
+        b = say(svc, "ui", "The user wants to contribute to open source", "open source", subject="user", predicate="goal")
+        assert b["memory"]["status"] == "active" and not b.get("conflict")
+        assert svc.ledger.get_memory(a["memory"]["id"])["status"] == "active"
+        assert b["related"][0]["outcome"] == "coexist"
+    finally:
+        svc.close()
+
+
+def test_near_neighbour_about_a_different_attribute_is_not_a_dispute():
+    from rufur.llm import LLM
+    from rufur.write import conflict
+
+    class Unclear(LLM):
+        def __init__(self, same):
+            self.same = same
+
+        def complete(self, role, system, prompt, schema):
+            usage = type("U", (), {"tokens_in": 1, "tokens_out": 1})()
+            return schema(outcome="unclear", same_attribute=self.same, reason="model"), usage
+
+    existing = {"source_type": "user", "trust": "high", "text": "SmartHire is in development.", "value": "development",
+                "predicate": "status"}  # fmt: skip
+    v, _ = conflict.classify(Unclear(None), existing, "SmartHire is a recruitment platform.", "vector", "recruitment platform")
+    assert v.outcome == "coexist"
+    v, _ = conflict.classify(Unclear(True), existing, "SmartHire is live.", "vector", "live")
+    assert v.outcome == "unclear"  # same question, incompatible answers: still a real dispute
+
+
+def test_users_own_name_is_the_user_subject(cfg):
+    svc = make(cfg)
+    try:
+        say(svc, "ui", "The user's name is Rahul Sharma", "Rahul Sharma", subject="user", predicate="name")
+        say(svc, "ui", "The user lives in Bangalore", "Bangalore", subject="user", predicate="home city")
+        res = say(svc, "ui", "Rahul lives in Hyderabad", "Hyderabad", subject="Rahul", predicate="home city")
+        assert svc.ledger.get_memory(res["memory"]["id"])["subject"] == "user"
+        assert res["related"] and res["related"][0]["outcome"] == "unclear"  # met as a key match, not missed
+    finally:
+        svc.close()

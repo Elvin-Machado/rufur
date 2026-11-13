@@ -8,6 +8,7 @@ first; access control is applied here, before any search or write.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import time
 from datetime import datetime
@@ -19,11 +20,13 @@ from .db.conn import Database, dumps
 from .embed import EmbedUnavailable, make_embedder
 from .events_bus import EventBus
 from .forget import engine as forget_engine
+from .forget import receipts as receipts_mod
 from .forget.purge import purge_memories
 from . import handover as ho
 from .ledger import Ledger
 from .llm import LLM, LLMUnavailable
 from .read.recall import CONTEXT_HEADER, fast_recall, render
+from .read.rerank import RerankUnavailable, make_reranker
 from .read.search import Filter
 from .read.verify import make_verifier
 from .read import working_set as ws_mod
@@ -67,6 +70,8 @@ class MemoryService:
         self.llm = llm or LLM(cfg)
         self.writer = WritePath(cfg, self.db, self.ledger, self.llm, self.embedder)
         self.verifier = make_verifier(self.llm)
+        self.fast_reranker = make_reranker(cfg, cfg.fast_reranker)
+        self.deep_reranker = make_reranker(cfg, cfg.deep_reranker)
         self.working_sets = ws_mod.WorkingSets()
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rufur-extract")
         self._check_embedder()
@@ -489,6 +494,7 @@ class MemoryService:
                exclude_sent: bool = False, record: bool = True) -> dict:  # fmt: skip
         """Working set → short-term → long-term. `exclude_sent` skips what this session already received."""
         started = time.perf_counter()
+        query = self._as_user(query)
         ws = self.working_sets.get(session_id)
         if ws is not None and ws["agent"] != agent:
             ws = None
@@ -504,7 +510,8 @@ class MemoryService:
                               half_life_days=self.cfg.recency_half_life_days, k=self.cfg.candidate_k,
                               verifier=self.verifier if (threshold is None and verify) else None,
                               verify_band=tuple(self.cfg.verify_band),
-                              exclude=ws["sent"] if (ws and exclude_sent) else None)  # fmt: skip
+                              exclude=ws["sent"] if (ws and exclude_sent) else None,
+                              reranker=self.fast_reranker, rerank_top_n=self.cfg.rerank_top_n)  # fmt: skip
             res = out.as_dict()
         ids = [it["id"] for it in res["items"]]
         if ws is not None:
@@ -538,11 +545,13 @@ class MemoryService:
 
         Every item carries its validity window, so old facts are labelled as old, not presented as current.
         """
+        query = self._as_user(query)
         statuses = ("active", "disputed", "superseded", "archived") if include_history else ("active", "disputed")
         flt = self._filter(agent, statuses=statuses, current_only=False, since=since, until=until)
         out = fast_recall(self.db, self.embedder, query, flt, token_budget=token_budget or 1500,
                           threshold=self.cfg.abstain_threshold, half_life_days=3650.0, k=self.cfg.candidate_k * 2,
                           verifier=self.verifier, verify_band=tuple(self.cfg.verify_band),
+                          reranker=self.fast_reranker, rerank_top_n=self.cfg.rerank_top_n,
                           header="Memories from the past. Items with until=... are no longer current. " + CONTEXT_HEADER)  # fmt: skip
         res = out.as_dict()
         res["path"] = "past"
@@ -562,6 +571,16 @@ class MemoryService:
             out["decisions_needed"] = pending
             out["context"] = "\n\n".join(filter(None, [out["context"], _render_decisions(pending)]))
         return out
+
+    def _as_user(self, query: str) -> str:
+        """Memories about the human are stored as "the user" (see WritePath._user_alias), so a question that
+        names them ("Where does Asha live?") is asked the same way before searching."""
+        for r in self.db.all("SELECT DISTINCT value FROM memories WHERE subject = 'user' "
+                             "AND predicate IN ('name', 'full name', 'user name') AND status IN ('active', 'disputed')"):  # fmt: skip
+            for name in {r["value"].strip(), r["value"].strip().split(" ")[0]}:
+                if len(name) >= 2:
+                    query = re.sub(rf"\b{re.escape(name)}('s)?\b", lambda m: "the user" + (m.group(1) or ""), query, flags=re.I)
+        return query
 
     def _readable_memory(self, agent: str, memory_id: str) -> dict:
         m = self.ledger.get_memory(memory_id)
@@ -608,34 +627,100 @@ class MemoryService:
 
     # ---------------------------------------------------------------- forget
 
-    def forget(self, agent: str, *, memory_id: str | None = None, query: str | None = None, confirm: bool = False,
-               include_history: bool = True) -> dict:  # fmt: skip
-        """By id: forget now. By query: return candidates unless `confirm` (then forget all candidates)."""
+    def forget(self, agent: str, *, memory_id: str | None = None, memory_ids: list[str] | None = None,
+               query: str | None = None, confirm: bool = False, include_history: bool = True,
+               cascade_mentions: bool = False) -> dict:  # fmt: skip
+        """By id(s): forget now. By query: return candidates and what would go with them, unless `confirm`
+        (then forget all candidates). To forget only some candidates, pass their `memory_ids`.
+        `cascade_mentions` also forgets the other memories that mention the forgotten value."""
         started = time.perf_counter()
-        if memory_id:
-            ids = [self._readable_memory(agent, memory_id)["id"]]
+        if memory_ids is not None and not memory_ids and not memory_id:
+            return {"forgotten": [], "report": None, "error": "no memory ids given"}
+        if memory_id or memory_ids:
+            ids = [self._forgettable(agent, mid)["id"] for mid in ([memory_id] if memory_id else []) + (memory_ids or [])]
         elif query:
             flt = self._filter(agent, min_trust="low", statuses=("active", "disputed", "quarantined"))
-            res = fast_recall(self.db, self.embedder, query, flt, token_budget=1500, threshold=self.cfg.abstain_threshold,
-                              half_life_days=self.cfg.recency_half_life_days, k=self.cfg.candidate_k)  # fmt: skip
-            candidates = [{k: it[k] for k in ("id", "text", "type", "status", "relevance")} for it in res.items]
+            keyed = [r for r in (self._masked(agent, r) for r in
+                                 forget_engine.key_match(self.db, query, flt.pool_ids + flt.stm_pool_ids)) if r]  # fmt: skip
+            found = self._forget_candidates(agent, query, flt, keyed)
+            candidates = found.pop("candidates")
+            # With a judge, only what it decided to forget goes; without one, every candidate (the agent picks).
+            chosen = [c for c in candidates if c.get("decision", "forget") == "forget"]
             if not confirm:
-                return {"confirm_required": True, "candidates": candidates}
-            ids = [c["id"] for c in candidates]
+                pre = forget_engine.preview(self.db, [c["id"] for c in chosen], include_history)
+                pre = {k: [x for x in (self._masked(agent, r) for r in v) if x] for k, v in pre.items()}
+                return {"confirm_required": True, "candidates": candidates, "search": found, **pre,
+                        "how_to_confirm": "call forget again with memory_ids=[...] for the ones the user means (or "
+                                          "confirm=true to forget the ones marked decision=forget); add "
+                                          "cascade_mentions=true if they also want also_mentioned_in gone"}  # fmt: skip
+            ids = [c["id"] for c in chosen]
         else:
-            raise ValueError("give memory_id or query")
+            raise ValueError("give memory_id, memory_ids or query")
         if not ids:
             return {"forgotten": [], "report": None}
         for mid in ids:
             m = self.ledger.get_memory(mid)
             if m and not self._can_write_pool(agent, m["pool_id"]):
                 raise AccessDenied(f"agent {agent!r} cannot forget memories in this pool")
-        out = forget_engine.forget(self.cfg, self.db, self.ledger, self.embedder, self.llm, ids, agent, include_history)
+        out = forget_engine.forget(self.cfg, self.db, self.ledger, self.embedder, self.llm, ids, agent, include_history,
+                                   cascade_mentions=cascade_mentions)  # fmt: skip
         self.ledger.metric("forget", (time.perf_counter() - started) * 1000, path="forget", agent=agent,
                            llm_tokens=(out.get("report") or {}).get("llm_tokens", 0),
                            meta={"count": len(out["forgotten"]),
                                  "completeness": (out.get("report") or {}).get("completeness")})  # fmt: skip
         return out
+
+    def _forget_candidates(self, agent: str, query: str, flt: Filter, keyed: list[dict]) -> dict:
+        """Qwen reranker + LLM judge when available; otherwise key matches plus a plain fast recall."""
+        try:
+            found = forget_engine.find_targets(self.cfg, self.db, self.embedder, self.llm, self.deep_reranker,
+                                               query, flt, keyed)  # fmt: skip
+            found["candidates"] = [x for x in (self._masked(agent, c) for c in found["candidates"]) if x]
+            return found
+        except RerankUnavailable as e:
+            fallback = str(e)
+        res = fast_recall(self.db, self.embedder, query, flt, token_budget=1500, threshold=self.cfg.abstain_threshold,
+                          half_life_days=self.cfg.recency_half_life_days, k=self.cfg.candidate_k)  # fmt: skip
+        candidates = [{**{k: r[k] for k in ("id", "text", "type", "status")}, "relevance": 1.0, "match": "key"}
+                      for r in keyed]  # fmt: skip
+        seen = {c["id"] for c in candidates}
+        candidates += [{**{k: it[k] for k in ("id", "text", "type", "status", "relevance")}, "match": "semantic"}
+                       for it in res.items if it["id"] not in seen]  # fmt: skip
+        return {"candidates": candidates, "scope": "recall", "reranker": None, "judge": None, "note": fallback}
+
+    def _masked(self, agent: str, r: dict) -> dict | None:
+        """A forget candidate as this agent may see it: in full if it can read it; as an id with hidden text
+        if it is above the agent's clearance but the user is talking to this agent (so they can ask for it
+        to be forgotten without the agent ever reading it); otherwise not at all."""
+        m = self.ledger.get_memory(r["id"])
+        if m is None:
+            return None
+        if self._can_read_memory(agent, m):
+            return r
+        if self._user_present(agent) and self._can_write_pool(agent, m["pool_id"]):
+            return {**r, "text": f"[{m['sensitivity']} memory, text hidden]"}
+        return None
+
+    def _forgettable(self, agent: str, memory_id: str) -> dict:
+        """Readable memories, plus ones above the agent's clearance when the user asked this agent directly:
+        a privacy request must not fail because the memory is too private for the agent to read."""
+        m = self.ledger.get_memory(memory_id)
+        if m and not self._can_read_memory(agent, m) and self._masked(agent, {"id": memory_id}):
+            return m
+        return self._readable_memory(agent, memory_id)
+
+    def forget_receipts(self, agent: str, limit: int = 50) -> list[dict]:
+        return receipts_mod.list_receipts(self.db, limit)
+
+    def forget_receipt(self, agent: str, receipt_id: str) -> dict:
+        r = receipts_mod.get(self.db, receipt_id)
+        if r is None:
+            raise NotFound(f"receipt {receipt_id!r} not found")
+        return r
+
+    def verify_forgetting(self, agent: str) -> dict:
+        """Re-verify every deletion receipt now: chain, signatures, ids still absent, nothing resurfaced."""
+        return receipts_mod.verify_chain(self.cfg, self.db)
 
     def _can_write_pool(self, agent: str, pool_id: str) -> bool:
         p = self._pool(pool_id)
@@ -739,12 +824,76 @@ class MemoryService:
         return rows
 
     def pool_spawn(self, agent: str, purpose: str, *, needs: list[str] | None = None, memory_ids: list[str] | None = None,
-                   ttl_minutes: int | None = None, session_id: str | None = None) -> dict:  # fmt: skip
+                   ttl_minutes: int | None = None, session_id: str | None = None, seed_budget: int = 2000) -> dict:  # fmt: skip
         if self.agent(agent)["user_id"].startswith("scratch:"):
             raise AccessDenied("a subagent can't spawn further pools")
-        return pools_mod.spawn(self, agent, purpose, needs or [], memory_ids or [], ttl_minutes, session_id)
+        return pools_mod.spawn(self, agent, purpose, needs or [], memory_ids or [], ttl_minutes, session_id, seed_budget)
+
+    def _by_address(self, agent: str, address: str) -> tuple[dict, str]:
+        try:
+            return pools_mod.resolve(self, agent, address)
+        except LookupError as e:
+            raise NotFound(str(e)) from e
+
+    def pool_search(self, agent: str, address: str, query: str, *, token_budget: int | None = None) -> dict:
+        """Search only the pool behind a memory address: its seeded memories and the subagent's own writes."""
+        p, sub = self._by_address(agent, address)
+        owner = self.agent(p["owner_agent"])
+        flt = Filter(pool_ids=[p["id"]], stm_pool_ids=[], member_pool_ids=[p["id"]],
+                     default_target=self._pool(self.cfg.default_pool)["id"], clearance=owner["clearance"],
+                     min_trust=self.cfg.min_trust)  # fmt: skip
+        out = fast_recall(self.db, self.embedder, self._as_user(query), flt,
+                          token_budget=token_budget or self.cfg.default_token_budget, threshold=self.cfg.abstain_threshold,
+                          half_life_days=self.cfg.recency_half_life_days, k=self.cfg.candidate_k,
+                          verifier=self.verifier, verify_band=tuple(self.cfg.verify_band),
+                          reranker=self.fast_reranker, rerank_top_n=self.cfg.rerank_top_n,
+                          header=f"Memories from pool {p['id']} ({p['purpose']}). " + CONTEXT_HEADER)  # fmt: skip
+        res = out.as_dict()
+        res["path"], res["pool"] = "pool", p["id"]
+        if res["abstained"]:
+            res["hint"] = "not in this pool; call pool_fetch with the same address to ask the memory layer for it"
+        self.ledger.metric("recall", res["latency_ms"], path="pool", agent=agent, tokens_in=estimate_tokens(query),
+                           tokens_out=res["tokens"], meta={"abstained": res["abstained"], "pool": p["id"]})  # fmt: skip
+        self.ledger.audit(agent, "pool.search", p["id"], {"items": [it["id"] for it in res["items"]]})
+        return res
+
+    def pool_remember(self, agent: str, address: str, text: str, *, type: str | None = None, subject: str = "",
+                      predicate: str = "", value: str = "") -> dict:  # fmt: skip
+        """Write into the pool behind an address. It stays there until pool_close files the useful parts back."""
+        p, sub = self._by_address(agent, address)
+        return self.remember(sub, text, type=type, subject=subject, predicate=predicate, value=value, source="agent")
+
+    def pool_fetch(self, agent: str, address: str, query: str, *, token_budget: int = 800) -> dict:
+        """The subagent needs something the seed missed: the memory layer searches the parent's memory with the
+        parent's permissions and adds the matches to the pool by reference, within a budget. Audited."""
+        p, sub = self._by_address(agent, address)
+        res = self.recall(p["owner_agent"], query, token_budget=token_budget, record=False)
+        have = {r["memory_id"] for r in self.db.all("SELECT memory_id FROM pool_members WHERE pool_id = ?", (p["id"],))}
+        added, spent = [], 0
+        for it in [] if res["abstained"] else res["items"]:
+            cost = estimate_tokens(it["text"])
+            if it["id"] in have or spent + cost > token_budget:
+                continue
+            self.db.execute("INSERT OR IGNORE INTO pool_members(pool_id, memory_id) VALUES(?,?)", (p["id"], it["id"]))
+            added.append({"id": it["id"], "text": it["text"]})
+            spent += cost
+        self.ledger.audit(agent, "pool.fetch", p["id"], {"added": [a["id"] for a in added]})
+        return {"pool": p["id"], "added": added, "tokens": spent,
+                "abstained": not added, "note": "now searchable with pool_search" if added else "the user's memory has nothing on this"}  # fmt: skip
+
+    def pool_info(self, agent: str, address: str) -> dict:
+        p, sub = self._by_address(agent, address)
+        items = pools_mod.manifest(self, p["id"])
+        return {"pool": p["id"], "purpose": p["purpose"], "owner": p["owner_agent"], "subagent": sub,
+                "expires_at": p["expires_at"], "items": items,
+                "tokens": sum(estimate_tokens(i["text"]) for i in items)}  # fmt: skip
 
     def pool_close(self, agent: str, pool_id: str, *, summary: str | None = None, reason: str = "closed") -> dict:
+        if pool_id.startswith("mem://"):
+            p, sub = self._by_address(agent, pool_id)
+            pool_id = p["id"]
+            if agent not in (p["owner_agent"], sub):
+                agent = sub  # the address holder closes it as the subagent
         try:
             return pools_mod.close(self, agent, pool_id, summary, reason)
         except LookupError as e:
@@ -767,6 +916,12 @@ class MemoryService:
     def sweep(self) -> dict:
         out = stm_mod.sweep(self)
         out["decisions_defaulted"] = resolve_mod.apply_defaults(self)
+        # Forgotten content that came back by a path that skipped the write-time tombstone check.
+        back = receipts_mod.recheck(self.db)
+        if back:
+            forget_engine.forget(self.cfg, self.db, self.ledger, self.embedder, self.llm, back, "sweeper", verify=False)
+            self.ledger.audit("sweeper", "forget.resurfaced", ",".join(back), {"count": len(back)})
+        out["resurfaced_forgotten"] = len(back)
         return out
 
     def stm_stats(self) -> dict:

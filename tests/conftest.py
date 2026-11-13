@@ -32,6 +32,9 @@ def fake_handler(role: str, prompt: str):
                 claims.append(dict(event=idx, type="preference", subject="user", predicate="preferred editor",
                                    value=ed.group(1), text=f"The user prefers {ed.group(1)} for editing.", quote=ed.group(0)))
         return {"claims": claims}
+    if role == "classify" and prompt.startswith("A: "):  # same-attribute check: "A: subject / attribute / value"
+        a, b = (line.split(" / ")[1] for line in prompt.splitlines()[:2])
+        return {"same": a.strip().lower() == b.strip().lower()}
     if role == "classify":
         new = prompt.split("NEW:", 1)[1]
         if "moved" in new:
@@ -44,7 +47,8 @@ def fake_handler(role: str, prompt: str):
 
 @pytest.fixture
 def cfg(tmp_path):
-    return load_config(tmp_path, embed_provider="hash", embed_dim=256)
+    # Rerankers are real models; tests that need one pass a fake.
+    return load_config(tmp_path, embed_provider="hash", embed_dim=256, fast_reranker="none", deep_reranker="none")
 
 
 @pytest.fixture

@@ -1,6 +1,10 @@
 """Scratch memory pools for subagents (plan v2 §4).
 
-A root agent spawns a pool describing what its subagent needs. The pool sees the
+A root agent spawns a pool describing what its subagent needs and gets back a memory address,
+`mem://<pool>/<secret>`. The address is a capability: whoever holds it (the subagent, given it in its
+prompt, and the root agent) can search and write that pool and nothing else, by passing it as a tool
+argument. That works even where a subagent shares its parent's MCP connection and identity, as in
+Claude Code. The pool is seeded within a token budget, so it stays small. The pool sees the
 matching parent memories *by reference* (pool_members), so later forgets or
 updates in the parent reach it, and the subagent gets its own identity that can
 read and write only that pool. Closing the pool files the subagent's useful
@@ -11,10 +15,12 @@ results back into the parent's short-term memory through the normal write path
 from __future__ import annotations
 
 import json
+import re
+import secrets
 from typing import TYPE_CHECKING
 
 from .db.conn import dumps
-from .textutil import new_id, now
+from .textutil import estimate_tokens, new_id, now, sha256
 from .write.pipeline import ClaimIn
 
 if TYPE_CHECKING:
@@ -22,23 +28,31 @@ if TYPE_CHECKING:
 
 
 def spawn(svc: "MemoryService", agent: str, purpose: str, needs: list[str], memory_ids: list[str],
-          ttl_minutes: int | None, session_id: str | None) -> dict:  # fmt: skip
+          ttl_minutes: int | None, session_id: str | None, seed_budget: int = 2000) -> dict:  # fmt: skip
     parent = svc.agent(agent)
-    seeded: list[str] = []
-    for need in needs:
-        res = svc.recall(agent, need, token_budget=1500, threshold=svc.cfg.abstain_threshold / 2)
-        seeded += [it["id"] for it in res["items"]]
-    seeded += [mid for mid in memory_ids if svc._safe_readable(agent, mid)]
-    seeded = list(dict.fromkeys(seeded))
+    # Explicit ids first, then the best matches for each need, until the seed budget is spent: the pool is
+    # meant to be small enough to fit the subagent's context without crowding it.
+    seeded = [mid for mid in memory_ids if svc._safe_readable(agent, mid)]
+    spent = sum(estimate_tokens(svc.ledger.get_memory(mid)["text"]) for mid in seeded)
+    for need in needs or [purpose]:
+        res = svc.recall(agent, need, token_budget=seed_budget, threshold=svc.cfg.abstain_threshold / 2, record=False)
+        for it in res["items"]:
+            cost = estimate_tokens(it["text"])
+            if it["id"] in seeded or spent + cost > seed_budget:
+                continue
+            seeded.append(it["id"])
+            spent += cost
 
     pid = new_id("pool")
+    secret = secrets.token_urlsafe(16)
+    address = f"mem://{pid}/{secret}"
     sub_name = f"{agent}/sub-{pid[-6:]}"
     expires = now() + 60 * (ttl_minutes or svc.cfg.scratch_ttl_min)
     svc.db.execute(
         "INSERT INTO pools(id, name, kind, owner, description, acl, created_at, parent_pool, owner_agent, owner_session, "
-        "expires_at, purpose) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        "expires_at, purpose, cap_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (pid, f"scratch:{pid}", "scratch", agent, purpose, dumps({"read": [sub_name], "write": [sub_name]}),
-         now(), svc.stm_pool(parent["user_id"])["id"], agent, session_id, expires, purpose),
+         now(), svc.stm_pool(parent["user_id"])["id"], agent, session_id, expires, purpose, sha256(secret)),
     )  # fmt: skip
     # The subagent is its own principal (user "scratch:<pool>"), so it can't see the user's STM or LTM,
     # and the parent doesn't see scratch work until pool_close files the useful parts back.
@@ -47,9 +61,41 @@ def spawn(svc: "MemoryService", agent: str, purpose: str, needs: list[str], memo
     svc.db.executemany("INSERT OR IGNORE INTO pool_members(pool_id, memory_id) VALUES(?,?)", [(pid, m) for m in seeded])
     svc.ledger.audit(agent, "pool.spawn", pid, {"seeded": len(seeded), "subagent": sub_name})
     svc.bus.publish("pool.spawned", id=pid, agent=sub_name, seeded=len(seeded))
-    return {"pool_id": pid, "scoped_key": key, "subagent": sub_name, "seeded": len(seeded), "expires_at": expires,
-            "how_to_use": "Give the subagent this key as RUFUR_API_KEY (or Authorization: Bearer) and tell it to "
-                          "use RUFUR's recall/remember tools; it only sees this pool. Call pool_close when it's done."}  # fmt: skip
+    return {"pool_id": pid, "address": address, "scoped_key": key, "subagent": sub_name, "seeded": len(seeded),
+            "seed_tokens": spent, "expires_at": expires, "manifest": manifest(svc, pid),
+            "how_to_use": f"Put this line in the subagent's prompt: 'Your memory address is {address}. Use RUFUR's "
+                          "pool_search / pool_remember / pool_fetch tools with it; it holds only what this task needs.' "
+                          "You can search it too with pool_search. Call pool_close with the address when it's done."}  # fmt: skip
+
+
+ADDRESS = re.compile(r"^mem://(pool_[0-9a-f]+)(?:/([A-Za-z0-9_-]+))?$")
+
+
+def resolve(svc: "MemoryService", agent: str, address: str) -> tuple[dict, str]:
+    """(open scratch pool, identity to act as) for a memory address. Holding the full address is enough;
+    the spawning agent and the subagent identity may also use the bare `mem://<pool>` form."""
+    m = ADDRESS.match(address.strip())
+    p = svc.db.one("SELECT * FROM pools WHERE id = ? AND kind = 'scratch'", (m.group(1),)) if m else None
+    sub = svc.db.one("SELECT name FROM agents WHERE user_id = ?", (f"scratch:{p['id']}",)) if p else None
+    if p is None or sub is None:
+        raise LookupError("unknown memory address")
+    holder = bool(m.group(2)) and p["cap_hash"] is not None and secrets.compare_digest(sha256(m.group(2)), p["cap_hash"])
+    if not (holder or agent in (p["owner_agent"], sub["name"])):
+        raise LookupError("unknown memory address")  # same answer as a pool that doesn't exist
+    if p["closed_at"] or (p["expires_at"] and p["expires_at"] < now()):
+        raise LookupError("this memory address is closed or expired")
+    return p, sub["name"]
+
+
+def manifest(svc: "MemoryService", pool_id: str) -> list[dict]:
+    """What the pool holds: seeded memories (by reference) and the subagent's own writes."""
+    rows = svc.db.all(
+        "SELECT m.id, m.text, m.type, 'seeded' AS origin FROM pool_members pm JOIN memories m ON m.id = pm.memory_id "
+        "WHERE pm.pool_id = ? AND m.status IN ('active', 'disputed') "
+        "UNION ALL SELECT id, text, type, 'own' FROM memories WHERE pool_id = ? AND status IN ('active', 'disputed')",
+        (pool_id, pool_id),
+    )
+    return rows
 
 
 def close(svc: "MemoryService", actor: str, pool_id: str, summary: str | None = None, reason: str = "closed") -> dict:
